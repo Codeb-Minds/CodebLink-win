@@ -1,0 +1,76 @@
+{
+  "name": "codeb-link-win",
+  "version": "1.0.0",
+  "description": "Codeb Link — Cross-device clipboard & file sync over LAN (Windows)",
+  "homepage": "https://link.codebminds.com",
+  "author": "Codeb Minds <contact@codebminds.com>",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "build:main": "tsc -p tsconfig.electron.json && node -e \"require('fs').copyFileSync('icon.png', 'dist-electron/icon.png')\"",
+    "build:renderer": "vite build",
+    "build": "npm run build:main && npm run build:renderer",
+    "dev": "npm run build:main && concurrently \"vite\" \"cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron .\"",
+    "start": "electron .",
+    "dist": "npm run build && electron-builder --win"
+  },
+  "build": {
+    "appId": "com.codebminds.codeblink",
+    "productName": "Codeb Link",
+    "icon": "icon.png",
+    "publish": {
+      "provider": "generic",
+      "url": "https://updates.codebminds.com/link/releases",
+      "channel": "latest"
+    },
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json",
+      "icon.png",
+      "favicon.svg",
+      "icons.svg",
+      "node_modules/**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ],
+      "icon": "icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "icon.ico",
+      "uninstallerIcon": "icon.ico"
+    }
+  },
+  "dependencies": {
+    "crypto-js": "^4.2.0",
+    "socket.io": "^4.7.4"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.9.0",
+    "@types/crypto-js": "^4.2.2",
+    "@types/node": "^22.5.5",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^9.0.1",
+    "cross-env": "^10.1.0",
+    "electron": "^26.6.10",
+    "electron-builder": "^24.13.3",
+    "eslint": "^9.9.0",
+    "eslint-plugin-react-hooks": "^5.1.0-rc.0",
+    "eslint-plugin-react-refresh": "^0.4.9",
+    "globals": "^15.9.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "typescript": "^5.5.3",
+    "typescript-eslint": "^8.0.1",
+    "vite": "^5.4.1"
+  }
+}
