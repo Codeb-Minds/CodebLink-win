@@ -8,8 +8,35 @@ function App() {
   const [logs, setLogs] = useState<string[]>(['System initialized. Waiting for Android device...']);
   const [syncKey, setSyncKey] = useState('CodebLink-Default-Key');
   const [showKey, setShowKey] = useState(false);
-  const [showTelemetry, setShowTelemetry] = useState(true);
+  const [showTelemetry, setShowTelemetry] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+
+  // Windows-to-Windows Connection State
+  const [discoveredPcs, setDiscoveredPcs] = useState<{ hostname: string; ip: string; port: number; machineId: string; isPaired: boolean }[]>([]);
+  const [clientConnected, setClientConnected] = useState(false);
+  const [clientIp, setClientIp] = useState('');
+  const [clientHostname, setClientHostname] = useState('');
+  const [clientError, setClientError] = useState('');
+  const [pairedDevices, setPairedDevices] = useState<{ machineId: string; hostname: string; lastKnownIp: string }[]>([]);
+  const [localMachineId, setLocalMachineId] = useState('');
+  
+  // Auto-updater state
+  const [updateState, setUpdateState] = useState<{
+    status: 'checking' | 'available' | 'uptodate' | 'downloading' | 'downloaded' | 'error' | 'dev';
+    version?: string;
+    percent?: number;
+    transferred?: number;
+    total?: number;
+    message?: string;
+  } | null>(null);
+
+  // Pairing Modal State
+  const [pairingModal, setPairingModal] = useState<{
+    pairingCode: string;
+    remoteHostname: string;
+    remoteIp: string;
+    isInitiator: boolean;
+  } | null>(null);
 
   const addLog = useCallback((message: string) => {
     const time = new Date().toLocaleTimeString();
@@ -42,12 +69,12 @@ function App() {
 
       window.ipcRenderer.on('device-connected', (_event, id) => {
         setIsConnected(true);
-        addLog(`Device connected: ${id}`);
+        addLog(`Android device connected: ${id}`);
       });
 
       window.ipcRenderer.on('device-disconnected', (_event, id) => {
         setIsConnected(false);
-        addLog(`Device disconnected: ${id}`);
+        addLog(`Android device disconnected: ${id}`);
       });
 
       window.ipcRenderer.on('clipboard-received', (_event, text) => {
@@ -61,18 +88,64 @@ function App() {
 
       window.ipcRenderer.on('file-send-status', (_event, info) => {
         if (info?.ok) {
-          addLog(`📤 Sent to Android: ${info.name}`);
+          addLog(`📤 File sent to devices: ${info.name}`);
         } else {
-          addLog(`❌ Send failed: ${info?.error || 'Unknown error'}`);
+          addLog(`❌ File send failed: ${info?.error || 'Unknown error'}`);
         }
       });
 
       window.ipcRenderer.on('file-delivered-phone', (_event, info) => {
         if (info?.ok) {
-          addLog(`✅ Android saved: ${info?.name || 'file'}`);
+          addLog(`✅ Remote device saved: ${info?.name || 'file'}`);
         } else {
-          addLog(`⚠️ Android failed to save ${info?.name || 'file'}${info?.error ? ` (${info.error})` : ''}`);
+          addLog(`⚠️ Remote device failed to save ${info?.name || 'file'}${info?.error ? ` (${info.error})` : ''}`);
         }
+      });
+
+      window.ipcRenderer.on('discovered-pcs', (_event, list) => {
+        setDiscoveredPcs(list);
+      });
+
+      window.ipcRenderer.on('client-connection-status', (_event, data) => {
+        const { connected, ip, hostname, error } = data;
+        setClientConnected(connected);
+        if (connected) {
+          setClientIp(ip);
+          setClientHostname(hostname || 'Remote PC');
+          setClientError('');
+          addLog(`🟢 Connected to remote PC: ${hostname || ip}`);
+        } else {
+          setClientIp('');
+          setClientHostname('');
+          if (error) {
+            setClientError(error);
+            addLog(`❌ Connection to remote PC failed: ${error}`);
+          } else {
+            addLog(`🔌 Disconnected from remote PC`);
+          }
+        }
+      });
+
+      window.ipcRenderer.on('sync-key-updated', (_event, newKey) => {
+        setSyncKey(newKey);
+        addLog(`🔑 Sync Key updated from external session: ${newKey}`);
+      });
+
+      window.ipcRenderer.on('show-pairing-popup', (_event, data) => {
+        setPairingModal(data);
+      });
+
+      window.ipcRenderer.on('hide-pairing-popup', () => {
+        setPairingModal(null);
+      });
+
+      window.ipcRenderer.on('pairing-state-updated', (_event, data) => {
+        setLocalMachineId(data.machineId);
+        setPairedDevices(data.pairedDevices);
+      });
+
+      window.ipcRenderer.on('updater:status', (_event, data) => {
+        setUpdateState(data);
       });
 
       // Global drag/drop prevention to stop browser from "opening" the file
@@ -89,11 +162,18 @@ function App() {
         } else if (connected && mode === 'socket') {
           addLog('🟢 Live Socket Active (Foreground Channel)');
         } else if (!connected) {
-          addLog('❌ Device Offline');
+          // Only show offline if client is also not connected
+          if (!clientConnected) {
+            addLog('❌ Android Device Offline');
+          }
         }
 
         setIsConnected(connected);
       });
+
+      // Request initial status
+      window.ipcRenderer.send('request-discovered-pcs');
+      window.ipcRenderer.send('get-pairing-state');
 
       // Cleanup
       return () => {
@@ -105,11 +185,18 @@ function App() {
         window.ipcRenderer.removeAllListeners('file-saved');
         window.ipcRenderer.removeAllListeners('file-send-status');
         window.ipcRenderer.removeAllListeners('file-delivered-phone');
+        window.ipcRenderer.removeAllListeners('discovered-pcs');
+        window.ipcRenderer.removeAllListeners('client-connection-status');
+        window.ipcRenderer.removeAllListeners('sync-key-updated');
+        window.ipcRenderer.removeAllListeners('show-pairing-popup');
+        window.ipcRenderer.removeAllListeners('hide-pairing-popup');
+        window.ipcRenderer.removeAllListeners('pairing-state-updated');
+        window.ipcRenderer.removeAllListeners('updater:status');
         window.removeEventListener('dragover', onGlobalDragOver);
         window.removeEventListener('drop', onGlobalDrop);
       };
     }
-  }, [addLog]);
+  }, [addLog, clientConnected]);
 
   const syncLocalClipboard = async () => {
     try {
@@ -125,7 +212,7 @@ function App() {
       if (window.ipcRenderer) {
         window.ipcRenderer.send('send-clipboard', text);
       }
-      addLog('Local clipboard synced to Android');
+      addLog('Local clipboard synced to devices');
     } catch (err) {
       addLog('Failed to read clipboard');
     }
@@ -137,6 +224,43 @@ function App() {
       window.ipcRenderer.send('set-sync-key', newKey);
     }
     addLog('Sync Key updated');
+  };
+
+  const connectToPc = (ip: string, machineId: string) => {
+    if (window.ipcRenderer) {
+      window.ipcRenderer.send('connect-to-pc', { ip, machineId });
+      addLog(`⏳ Initiating connection to PC...`);
+    }
+  };
+
+  const disconnectFromPc = () => {
+    if (window.ipcRenderer) {
+      window.ipcRenderer.send('disconnect-from-pc');
+    }
+  };
+
+  const unpairDevice = (machineId: string) => {
+    if (window.ipcRenderer) {
+      window.ipcRenderer.send('unpair-device', machineId);
+    }
+  };
+
+  const acceptPairing = () => {
+    if (window.ipcRenderer) {
+      window.ipcRenderer.send('accept-pairing');
+    }
+  };
+
+  const rejectPairing = () => {
+    if (window.ipcRenderer) {
+      window.ipcRenderer.send('reject-pairing');
+    }
+  };
+
+  const cancelPairing = () => {
+    if (window.ipcRenderer) {
+      window.ipcRenderer.send('cancel-pairing');
+    }
   };
 
   const handleDragEnter = (e: React.DragEvent) => {
@@ -198,12 +322,154 @@ function App() {
     }
   };
 
+  const renderUpdateBadge = () => {
+    if (!updateState) return null;
+    const { status, version, percent, message } = updateState;
+
+    if (status === 'available') {
+      return (
+        <span style={{
+          fontSize: '0.7rem',
+          fontWeight: 600,
+          padding: '4px 10px',
+          borderRadius: '9999px',
+          background: '#dbeafe',
+          color: '#1e3a8a',
+          marginRight: '10px'
+        }}>
+          v{version} available
+        </span>
+      );
+    }
+
+    if (status === 'downloading') {
+      return (
+        <span style={{
+          fontSize: '0.7rem',
+          fontWeight: 600,
+          padding: '4px 10px',
+          borderRadius: '9999px',
+          background: 'rgba(255,255,255,0.1)',
+          color: 'var(--fg-color)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '6px',
+          marginRight: '10px'
+        }}>
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" style={{ animation: 'spin 2s linear infinite' }}>
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <polyline points="19 12 12 19 5 12"></polyline>
+          </svg>
+          Downloading {percent}%
+        </span>
+      );
+    }
+
+    if (status === 'downloaded') {
+      return (
+        <button
+          onClick={() => window.ipcRenderer.send('updater:install')}
+          style={{
+            fontSize: '0.7rem',
+            fontWeight: 700,
+            padding: '5px 12px',
+            borderRadius: '9999px',
+            cursor: 'pointer',
+            background: '#15803d',
+            color: '#fff',
+            border: 'none',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '6px',
+            marginRight: '10px',
+            transition: 'background 0.2s'
+          }}
+          onMouseEnter={(e) => e.currentTarget.style.background = '#166534'}
+          onMouseLeave={(e) => e.currentTarget.style.background = '#15803d'}
+          title={`v${version} ready — click to restart and install`}
+        >
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="23 4 23 10 17 10"></polyline>
+            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+          </svg>
+          Restart to update
+        </button>
+      );
+    }
+
+    if (status === 'error') {
+      return (
+        <span
+          style={{
+            fontSize: '0.7rem',
+            fontWeight: 600,
+            padding: '4px 10px',
+            borderRadius: '9999px',
+            background: '#fee2e2',
+            color: '#b91c1c',
+            marginRight: '10px'
+          }}
+          title={message}
+        >
+          Update error
+        </span>
+      );
+    }
+
+    return null;
+  };
+
   return (
     <div
       className="app-container"
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
     >
+      {/* Pairing Popup Modal */}
+      {pairingModal && (
+        <div className="modal-overlay">
+          <div className="pairing-modal-content">
+            <div className="pairing-modal-glow"></div>
+            <span className="pairing-device-icon">💻</span>
+            <h3>
+              {pairingModal.isInitiator 
+                ? `Pairing with ${pairingModal.remoteHostname}` 
+                : `Pairing Request`}
+            </h3>
+            <p className="ip-text">IP Address: {pairingModal.remoteIp}</p>
+            
+            <div className="pairing-code-box">
+              {pairingModal.pairingCode.split('').map((char, index) => (
+                <span key={index} className="pairing-digit">{char}</span>
+              ))}
+            </div>
+            
+            <p className="instruction-text">
+              {pairingModal.isInitiator 
+                ? "Confirm this pairing code matches on the target PC."
+                : `Verify this code matches on the requesting PC to authorize connection from ${pairingModal.remoteHostname}.`}
+            </p>
+            
+            <div className="modal-actions">
+              {pairingModal.isInitiator ? (
+                <button className="btn btn-danger btn-cancel-modal" onClick={cancelPairing}>
+                  Cancel
+                </button>
+              ) : (
+                <>
+                  <button className="btn btn-accept" onClick={acceptPairing}>
+                    Accept
+                  </button>
+                  <button className="btn btn-reject btn-danger" onClick={rejectPairing}>
+                    Reject
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Global Drag Overlay */}
       <div
         className={`global-drag-overlay ${isDragging ? 'visible' : ''}`}
@@ -220,16 +486,19 @@ function App() {
             </svg>
           </div>
           <h3>Drop to Share</h3>
-          <p>Drop your file anywhere to send it to your Android device</p>
+          <p>Drop your file anywhere to send it to connected devices</p>
         </div>
       </div>
       <header className="header">
         <div style={{ pointerEvents: 'none' }}>
           <h1>CODEB LINK</h1>
         </div>
-        <div className="status-indicator">
-          <div className={`dot ${!isConnected ? 'offline' : ''}`}></div>
-          {isConnected ? 'ENCRYPTED TUNNEL ACTIVE' : 'DISCONNECTED'}
+        <div style={{ display: 'flex', alignItems: 'center' }}>
+          {renderUpdateBadge()}
+          <div className="status-indicator">
+            <div className={`dot ${!(isConnected || clientConnected) ? 'offline' : ''}`}></div>
+            {(isConnected || clientConnected) ? 'ENCRYPTED TUNNEL ACTIVE' : 'DISCONNECTED'}
+          </div>
         </div>
       </header>
 
@@ -240,21 +509,23 @@ function App() {
             <div style={{
               background: '#fff',
               padding: '10px',
-              borderRadius: '8px',
+              borderRadius: '12px',
               display: 'flex',
               justifyContent: 'center',
-              boxShadow: '0 0 20px rgba(255,255,255,0.1)'
+              boxShadow: '0 0 15px rgba(0,0,0,0.5)',
+              overflow: 'hidden'
             }}>
               <img
                 src={qrUrl}
                 alt="Connect QR"
-                style={{ width: '180px', height: '180px' }}
+                style={{ width: '140px', height: '140px', borderRadius: '4px' }}
               />
             </div>
             <p style={{ fontSize: '0.65rem', color: 'var(--muted)', textAlign: 'center', marginTop: '8px' }}>
               SCAN TO CONNECT INSTANTLY
             </p>
           </div>
+
 
           <div className="card">
             <h2>Local Node</h2>
@@ -320,8 +591,7 @@ function App() {
             <p style={{ fontSize: '0.6rem', color: 'var(--muted)', marginTop: '4px' }}>Must match Android device</p>
           </div>
 
-          <div className="card" style={{ marginTop: 'auto' }}>
-            <h2>Infrastructure</h2>
+          <div className="" style={{ marginTop: 'auto' }}>
             <p style={{ fontSize: '0.7rem', color: 'var(--muted)' }}>&copy; {new Date().getFullYear()} CODEB MINDS</p>
           </div>
         </aside>
@@ -333,9 +603,81 @@ function App() {
               {clipboardText || 'Awaiting synchronization...'}
             </div>
             <button className="btn" onClick={syncLocalClipboard}>
-              Push to Android
+              Push to Devices
             </button>
           </div>
+
+          <div className="card">
+            <h2>Windows Node Link (PC-to-PC)</h2>
+            <div className="windows-link-container">
+              {clientConnected ? (
+                <div className="connected-banner">
+                  <div className="banner-info">
+                    <span className="banner-icon">💻</span>
+                    <div>
+                      <div className="banner-title">CONNECTED TO REMOTE HOST</div>
+                      <div className="banner-desc">{clientHostname} ({clientIp})</div>
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', gap: '8px' }}>
+                    <button className="btn btn-sm btn-danger" onClick={disconnectFromPc}>
+                      Disconnect
+                    </button>
+                    {pairedDevices.find(d => d.hostname === clientHostname)?.machineId && (
+                      <button className="btn btn-sm btn-danger" onClick={() => {
+                        unpairDevice(pairedDevices.find(d => d.hostname === clientHostname)!.machineId);
+                      }}>
+                        Unpair
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="discovery-section">
+                  {clientError && <div className="error-banner">{clientError}</div>}
+
+                  <div className="discovered-list-container">
+                    <h3>DISCOVERED NEARBY WINDOWS PCs</h3>
+                    {discoveredPcs.length === 0 ? (
+                      <div className="no-nodes">
+                        <div className="pulse-dot"></div>
+                        Searching for nearby Windows PCs on WiFi...
+                      </div>
+                    ) : (
+                      <div className="pc-list">
+                        {discoveredPcs.map((pc) => (
+                          <div className="pc-row" key={pc.ip}>
+                            <div className="pc-info">
+                              <span className="pc-icon">💻</span>
+                              <div>
+                                <div className="pc-name" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                  {pc.hostname}
+                                  {pc.isPaired && <span className="paired-badge">PAIRED</span>}
+                                </div>
+                                <div className="pc-ip">{pc.ip}</div>
+                              </div>
+                            </div>
+                            <div className="pc-actions" style={{ display: 'flex', gap: '8px' }}>
+                              <button className="btn btn-sm" onClick={() => connectToPc(pc.ip, pc.machineId)}>
+                                {pc.isPaired ? "Connect" : "Pair & Connect"}
+                              </button>
+                              {pc.isPaired && (
+                                <button className="btn btn-sm btn-danger" onClick={() => unpairDevice(pc.machineId)}>
+                                  Unpair
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+
 
           <div className="card" style={{ flex: 1 }}>
             <h2>Universal File Share</h2>

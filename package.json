@@ -1,21 +1,22 @@
 {
   "name": "codeb-link-win",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Codeb Link — Cross-device clipboard & file sync over LAN (Windows)",
   "homepage": "https://link.codebminds.com",
   "author": "Codeb Minds <contact@codebminds.com>",
   "main": "dist-electron/main.js",
   "scripts": {
-    "build:main": "tsc -p tsconfig.electron.json && node -e \"require('fs').copyFileSync('icon.png', 'dist-electron/icon.png')\"",
+    "build:main": "tsc -p tsconfig.electron.json && node -e \"require('fs').copyFileSync('icon.png', 'dist-electron/icon.png'); require('fs').copyFileSync('icon.ico', 'dist-electron/icon.ico')\"",
     "build:renderer": "vite build",
     "build": "npm run build:main && npm run build:renderer",
-    "dev": "npm run build:main && concurrently \"vite\" \"cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron .\"",
+    "dev": "npm run build:main && concurrently \"vite --host\" \"cross-env VITE_DEV_SERVER_URL=http://localhost:5173 electron .\"",
     "start": "electron .",
     "dist": "npm run build && electron-builder --win"
   },
   "build": {
     "appId": "com.codebminds.codeblink",
     "productName": "Codeb Link",
+    "artifactName": "Codeb-Link-Setup-${version}.${ext}",
     "icon": "icon.png",
     "publish": {
       "provider": "generic",
@@ -50,7 +51,9 @@
   },
   "dependencies": {
     "crypto-js": "^4.2.0",
-    "socket.io": "^4.7.4"
+    "electron-updater": "^6.8.3",
+    "socket.io": "^4.7.4",
+    "socket.io-client": "^4.7.4"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.0",
