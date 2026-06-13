@@ -293,10 +293,6 @@ input {
   -webkit-user-select: none;
 }
 
-.clipboard-box:hover {
-  border-color: var(--muted);
-}
-
 .btn {
   padding: 0.8rem 1.2rem;
   border: 1px solid var(--border);
@@ -315,7 +311,6 @@ input {
 
 .btn:hover {
   background: #e5e5e5;
-  transform: scale(1.02);
 }
 
 .file-drop-area {

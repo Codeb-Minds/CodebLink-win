@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import './index.css';
+import logoPng from './icon.png';
 
 function App() {
   const [ipAddress, setIpAddress] = useState('Loading...');
@@ -29,6 +30,16 @@ function App() {
     total?: number;
     message?: string;
   } | null>(null);
+
+  // App Info Modal State
+  const [infoModalOpen, setInfoModalOpen] = useState(false);
+  const [appInfo, setAppInfo] = useState<{
+    version: string;
+    lastUpdated: string | null;
+    platform: string;
+  } | null>(null);
+
+  const [isMaximized, setIsMaximized] = useState(false);
 
   // Pairing Modal State
   const [pairingModal, setPairingModal] = useState<{
@@ -65,6 +76,20 @@ function App() {
       // Get IP
       window.ipcRenderer.invoke('get-local-ip').then((ip: string) => {
         setIpAddress(ip);
+      });
+
+      // Get App Info
+      window.ipcRenderer.invoke('app:getInfo').then((info: any) => {
+        setAppInfo(info);
+      });
+
+      // Get maximize status
+      window.ipcRenderer.invoke('window:isMaximized').then((max: boolean) => {
+        setIsMaximized(max);
+      });
+
+      window.ipcRenderer.on('window:maximized', (_event, max: boolean) => {
+        setIsMaximized(max);
       });
 
       window.ipcRenderer.on('device-connected', (_event, id) => {
@@ -192,6 +217,7 @@ function App() {
         window.ipcRenderer.removeAllListeners('hide-pairing-popup');
         window.ipcRenderer.removeAllListeners('pairing-state-updated');
         window.ipcRenderer.removeAllListeners('updater:status');
+        window.ipcRenderer.removeAllListeners('window:maximized');
         window.removeEventListener('dragover', onGlobalDragOver);
         window.removeEventListener('drop', onGlobalDrop);
       };
@@ -215,6 +241,17 @@ function App() {
       addLog('Local clipboard synced to devices');
     } catch (err) {
       addLog('Failed to read clipboard');
+    }
+  };
+
+  const handleCheckUpdates = async () => {
+    if (window.ipcRenderer) {
+      setUpdateState({ status: 'checking' });
+      const res = await window.ipcRenderer.invoke('updater:check');
+      if (res?.status === 'dev') {
+        setUpdateState({ status: 'dev' });
+        addLog('Updates disabled in developer mode');
+      }
     }
   };
 
@@ -425,6 +462,129 @@ function App() {
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
     >
+      {/* Custom Title Bar */}
+      <div 
+        className="window-titlebar"
+        style={{
+          height: '30px',
+          background: 'var(--bg-color)',
+          display: 'flex',
+          justifyContent: 'flex-end',
+          alignItems: 'center',
+          WebkitAppRegion: 'drag',
+          userSelect: 'none',
+          zIndex: 9999
+        }}
+      >
+        <div 
+          style={{ 
+            display: 'flex', 
+            WebkitAppRegion: 'no-drag' 
+          }}
+        >
+          {/* Minimize Button */}
+          <button
+            onClick={() => window.ipcRenderer?.send('window:minimize')}
+            className="titlebar-btn"
+            style={{
+              width: '45px',
+              height: '30px',
+              background: 'none',
+              border: 'none',
+              color: 'var(--muted)',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              transition: 'background 0.2s, color 0.2s'
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = 'rgba(255, 255, 255, 0.05)';
+              e.currentTarget.style.color = 'var(--fg-color)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = 'none';
+              e.currentTarget.style.color = 'var(--muted)';
+            }}
+            title="Minimize"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="5" y1="12" x2="19" y2="12"></line>
+            </svg>
+          </button>
+
+          {/* Maximize / Restore Button */}
+          <button
+            onClick={() => window.ipcRenderer?.send('window:maximize')}
+            className="titlebar-btn"
+            style={{
+              width: '45px',
+              height: '30px',
+              background: 'none',
+              border: 'none',
+              color: 'var(--muted)',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              transition: 'background 0.2s, color 0.2s'
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = 'rgba(255, 255, 255, 0.05)';
+              e.currentTarget.style.color = 'var(--fg-color)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = 'none';
+              e.currentTarget.style.color = 'var(--muted)';
+            }}
+            title={isMaximized ? 'Restore' : 'Maximize'}
+          >
+            {isMaximized ? (
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="8" y="4" width="12" height="12" rx="1.5"></rect>
+                <path d="M4 8v10a2 2 0 0 0 2 2h10" style={{ fill: 'none' }}></path>
+              </svg>
+            ) : (
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+              </svg>
+            )}
+          </button>
+
+          {/* Close Button */}
+          <button
+            onClick={() => window.ipcRenderer?.send('window:close')}
+            className="titlebar-btn close-btn"
+            style={{
+              width: '45px',
+              height: '30px',
+              background: 'none',
+              border: 'none',
+              color: 'var(--muted)',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              transition: 'background 0.2s, color 0.2s'
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = '#ef4444';
+              e.currentTarget.style.color = '#ffffff';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = 'none';
+              e.currentTarget.style.color = 'var(--muted)';
+            }}
+            title="Close"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
+          </button>
+        </div>
+      </div>
+
       {/* Pairing Popup Modal */}
       {pairingModal && (
         <div className="modal-overlay">
@@ -470,6 +630,175 @@ function App() {
         </div>
       )}
 
+      {/* App Info Modal */}
+      {infoModalOpen && (
+        <div className="modal-overlay" onClick={() => setInfoModalOpen(false)}>
+          <div className="pairing-modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '400px', padding: '2.5rem 2rem' }}>
+            <div className="pairing-modal-glow"></div>
+            
+            {/* App Icon */}
+            <div style={{
+              width: '64px',
+              height: '64px',
+              borderRadius: '16px',
+              background: '#16171a',
+              border: '1px solid var(--border)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              boxShadow: '0 0 20px rgba(0,0,0,0.5)',
+              zIndex: 2,
+              marginBottom: '8px'
+            }}>
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+              </svg>
+            </div>
+
+            <h3 style={{ fontSize: '1.4rem', fontWeight: 800, margin: 0, zIndex: 2 }}>Codeb Link</h3>
+            <p style={{ fontSize: '0.85rem', color: 'var(--muted)', margin: 0, zIndex: 2 }}>
+              Cross-device clipboard & file sync over LAN
+            </p>
+
+            <div style={{
+              width: '100%',
+              background: 'rgba(255, 255, 255, 0.02)',
+              border: '1px solid var(--border)',
+              borderRadius: '12px',
+              padding: '16px',
+              textAlign: 'left',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '10px',
+              fontSize: '0.8rem',
+              zIndex: 2
+            }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'var(--muted)' }}>Version</span>
+                <span style={{ fontFamily: 'monospace', fontWeight: 600 }}>{appInfo?.version || '1.1.0'}</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'var(--muted)' }}>Platform</span>
+                <span style={{ textTransform: 'capitalize' }}>{appInfo?.platform || 'Windows'}</span>
+              </div>
+              {appInfo?.lastUpdated && (
+                <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                  <span style={{ color: 'var(--muted)' }}>Last Updated</span>
+                  <span>
+                    {(() => {
+                      try {
+                        let date = new Date(appInfo.lastUpdated);
+                        if (isNaN(date.getTime())) {
+                          // Try manual parsing of MM/DD/YYYY or DD/MM/YYYY
+                          const match = appInfo.lastUpdated.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})$/);
+                          if (match) {
+                            const p1 = parseInt(match[1], 10);
+                            const p2 = parseInt(match[2], 10);
+                            const year = parseInt(match[3], 10);
+                            if (p1 <= 12) {
+                              date = new Date(year, p1 - 1, p2);
+                            } else {
+                              date = new Date(year, p2 - 1, p1);
+                            }
+                          }
+                        }
+                        if (isNaN(date.getTime())) {
+                          return appInfo.lastUpdated;
+                        }
+                        const day = date.getDate();
+                        const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+                        const month = months[date.getMonth()];
+                        const year = date.getFullYear();
+                        return `${day} ${month} ${year}`;
+                      } catch (e) {
+                        return appInfo.lastUpdated;
+                      }
+                    })()}
+                  </span>
+                </div>
+              )}
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'var(--muted)' }}>Organisation</span>
+                <span style={{ fontWeight: 600 }}>Codeb Minds</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                <span style={{ color: 'var(--muted)' }}>Website</span>
+                <a 
+                  href="https://link.codebminds.com" 
+                  target="_blank" 
+                  rel="noreferrer" 
+                  style={{ color: 'var(--accent)', textDecoration: 'none', fontWeight: 600 }}
+                  onMouseEnter={(e) => e.currentTarget.style.textDecoration = 'underline'}
+                  onMouseLeave={(e) => e.currentTarget.style.textDecoration = 'none'}
+                >
+                  link.codebminds.com
+                </a>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ color: 'var(--muted)' }}>Updates</span>
+                <span style={{ fontWeight: 600 }}>
+                  {updateState?.status === 'checking' && 'Checking...'}
+                  {updateState?.status === 'available' && `v${updateState.version} available!`}
+                  {updateState?.status === 'downloading' && `Downloading (${updateState.percent}%)`}
+                  {updateState?.status === 'downloaded' && 'Ready to install'}
+                  {updateState?.status === 'uptodate' && 'Up to date'}
+                  {updateState?.status === 'error' && 'Check failed'}
+                  {updateState?.status === 'dev' && 'Disabled (Dev Mode)'}
+                  {!updateState && 'Idle'}
+                </span>
+              </div>
+            </div>
+
+            <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '8px', zIndex: 2, marginTop: '4px' }}>
+              <button
+                className="btn"
+                onClick={handleCheckUpdates}
+                disabled={updateState?.status === 'checking' || updateState?.status === 'downloading'}
+                style={{
+                  width: '100%',
+                  background: 'var(--accent)',
+                  color: 'var(--accent-text)',
+                  border: 'none',
+                  opacity: (updateState?.status === 'checking' || updateState?.status === 'downloading') ? 0.6 : 1,
+                  cursor: (updateState?.status === 'checking' || updateState?.status === 'downloading') ? 'not-allowed' : 'pointer'
+                }}
+                onMouseEnter={(e) => {
+                  if (updateState?.status !== 'checking' && updateState?.status !== 'downloading') {
+                    e.currentTarget.style.background = '#e5e5e5';
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  if (updateState?.status !== 'checking' && updateState?.status !== 'downloading') {
+                    e.currentTarget.style.background = 'var(--accent)';
+                  }
+                }}
+              >
+                {updateState?.status === 'checking' ? 'Checking for updates...' : 'Check for updates'}
+              </button>
+
+              <button 
+                className="btn" 
+                onClick={() => setInfoModalOpen(false)}
+                style={{
+                  width: '100%',
+                  background: 'rgba(255, 255, 255, 0.05)',
+                  color: 'var(--fg-color)',
+                  border: '1px solid var(--border)'
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.1)';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = 'rgba(255, 255, 255, 0.05)';
+                }}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Global Drag Overlay */}
       <div
         className={`global-drag-overlay ${isDragging ? 'visible' : ''}`}
@@ -490,8 +819,9 @@ function App() {
         </div>
       </div>
       <header className="header">
-        <div style={{ pointerEvents: 'none' }}>
-          <h1>CODEB LINK</h1>
+        <div style={{ pointerEvents: 'none', display: 'flex', alignItems: 'center', gap: '8px' }}>
+          <img src={logoPng} alt="Codeb Link Logo" style={{ width: '22px', height: '22px', borderRadius: '4px' }} />
+          <h1>Codeb Link</h1>
         </div>
         <div style={{ display: 'flex', alignItems: 'center' }}>
           {renderUpdateBadge()}
@@ -499,6 +829,30 @@ function App() {
             <div className={`dot ${!(isConnected || clientConnected) ? 'offline' : ''}`}></div>
             {(isConnected || clientConnected) ? 'ENCRYPTED TUNNEL ACTIVE' : 'DISCONNECTED'}
           </div>
+          <button
+            onClick={() => setInfoModalOpen(true)}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: 'var(--muted)',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              padding: '4px',
+              marginLeft: '12px',
+              transition: 'color 0.2s'
+            }}
+            onMouseEnter={(e) => e.currentTarget.style.color = 'var(--fg-color)'}
+            onMouseLeave={(e) => e.currentTarget.style.color = 'var(--muted)'}
+            title="App Information"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="16" x2="12" y2="12"></line>
+              <line x1="12" y1="8" x2="12.01" y2="8"></line>
+            </svg>
+          </button>
         </div>
       </header>
 

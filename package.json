@@ -1,6 +1,6 @@
 {
   "name": "codeb-link-win",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Codeb Link — Cross-device clipboard & file sync over LAN (Windows)",
   "homepage": "https://link.codebminds.com",
   "author": "Codeb Minds <contact@codebminds.com>",
@@ -43,8 +43,8 @@
       "icon": "icon.ico"
     },
     "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
+      "oneClick": true,
+      "allowToChangeInstallationDirectory": false,
       "installerIcon": "icon.ico",
       "uninstallerIcon": "icon.ico"
     }

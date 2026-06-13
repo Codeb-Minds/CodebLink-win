@@ -173,6 +173,7 @@ function createWindow() {
     height,
     icon: fs.existsSync(windowIconPath) ? windowIconPath : undefined,
     show: false,
+    frame: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: true,
@@ -189,6 +190,9 @@ function createWindow() {
       win.show();
     }
   });
+
+  win.on('maximize', () => { if (win && !win.isDestroyed()) win.webContents.send('window:maximized', true); });
+  win.on('unmaximize', () => { if (win && !win.isDestroyed()) win.webContents.send('window:maximized', false); });
 
   win.on('close', (event: any) => {
     if (!isQuitting) {
@@ -1305,7 +1309,8 @@ function setupAutoUpdater() {
 
 // Allow renderer to trigger install-and-restart
 ipcMain.on('updater:install', () => {
-  autoUpdater.quitAndInstall(false, true);
+  isQuitting = true;
+  autoUpdater.quitAndInstall(true, true);
 });
 
 // Allow renderer to manually trigger a check
@@ -1321,5 +1326,28 @@ ipcMain.handle('app:getInfo', () => {
     lastUpdated: config.lastUpdated ?? null,
     platform: process.platform,
   };
+});
+
+// Allow renderer to control window states
+ipcMain.on('window:minimize', () => {
+  win?.minimize();
+});
+
+ipcMain.on('window:maximize', () => {
+  if (win) {
+    if (win.isMaximized()) {
+      win.unmaximize();
+    } else {
+      win.maximize();
+    }
+  }
+});
+
+ipcMain.on('window:close', () => {
+  win?.close();
+});
+
+ipcMain.handle('window:isMaximized', () => {
+  return win?.isMaximized() ?? false;
 });
 
