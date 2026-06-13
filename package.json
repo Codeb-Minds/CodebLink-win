@@ -61,7 +61,7 @@
     "@types/node": "^22.5.5",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
-    "@vitejs/plugin-react": "^4.3.1",
+    "@vitejs/plugin-react": "^6.0.2",
     "concurrently": "^9.0.1",
     "cross-env": "^10.1.0",
     "electron": "^26.6.10",
@@ -74,6 +74,6 @@
     "react-dom": "^19.0.0",
     "typescript": "^5.5.3",
     "typescript-eslint": "^8.0.1",
-    "vite": "^5.4.1"
+    "vite": "^8.0.16"
   }
 }
