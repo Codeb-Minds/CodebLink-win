@@ -1,13 +1,14 @@
-import { app, BrowserWindow, ipcMain, clipboard, Tray, Menu, screen, nativeImage } from 'electron';
+import { app, BrowserWindow, ipcMain, clipboard, Tray, Menu, screen } from 'electron';
+import { autoUpdater } from 'electron-updater';
 import * as path from 'path';
+import * as dgram from 'dgram';
 import * as http from 'http';
 import { Server } from 'socket.io';
 import * as os from 'os';
 import * as fs from 'fs';
 import * as CryptoJS from 'crypto-js';
+import { execSync, spawnSync } from 'child_process';
 import * as crypto from 'crypto';
-import * as dgram from 'dgram';
-import { autoUpdater } from 'electron-updater';
 
 type FilePayload = {
   name: string;
@@ -20,16 +21,6 @@ type FilePayload = {
 import { EventEmitter } from 'events';
 const ghostBus = new EventEmitter();
 
-// State
-let win: BrowserWindow | null = null;
-let tray: Tray | null = null;
-let io: Server | null = null;
-let lastClipboardText = clipboard.readText() || '';
-let isQuitting = false;
-let syncKey = 'CodebLink-Default-Key';
-const pollListeners = new Set<(text: string) => void>();
-
-// Config and pairing persistence
 interface PairedDevice {
   machineId: string;
   hostname: string;
@@ -47,54 +38,9 @@ let config: AppConfig = {
   machineId: '',
   pairedDevices: []
 };
-
 let configPath: string;
 
-function loadConfig() {
-  try {
-    configPath = path.join(app.getPath('userData'), 'config.json');
-    if (fs.existsSync(configPath)) {
-      const data = fs.readFileSync(configPath, 'utf8');
-      config = JSON.parse(data);
-    }
-  } catch (e) {
-    console.error('Failed to load config:', e);
-  }
-  
-  if (!config.machineId) {
-    config.machineId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
-    saveConfig();
-  }
-  if (!config.pairedDevices) {
-    config.pairedDevices = [];
-    saveConfig();
-  }
-}
-
-function saveConfig() {
-  try {
-    if (configPath) {
-      fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
-    }
-  } catch (e) {
-    console.error('Failed to save config:', e);
-  }
-}
-
-function sendPairingState() {
-  win?.webContents.send('pairing-state-updated', {
-    machineId: config.machineId,
-    pairedDevices: config.pairedDevices
-  });
-}
-
-// 📦 GHOST VAULT: Holds the last message for 60s for phones "between" polls
-let ghostVault: { content: string; timestamp: number } | null = null;
-
-// 📁 PENDING DOWNLOADS: token → file path, expires after 10 minutes
-const pendingDownloads = new Map<string, { filePath: string; expires: number }>();
-
-// 🖥️ Windows-to-Windows Connection State
+// 🖥️ PC-to-PC Connection State
 let clientSocket: any = null;
 let clientSocketSecretKey = '';
 let clientSocketMachineId = '';
@@ -102,11 +48,27 @@ let clientSocketHostname = '';
 let currentPairingIp = '';
 let clientConnected = false;
 let connectedHostInfo: { hostname: string; ip: string } | null = null;
-const discoveredPcs = new Map<string, { hostname: string; ip: string; port: number; machineId: string; lastSeen: number }>();
+const discoveredPcs = new Map<string, { hostname: string; ip: string; port: number; machineId: string; lastSeen: number; device?: 'windows' | 'linux' | 'android' }>();
 let udpSocket: dgram.Socket | null = null;
 let udpBroadcastInterval: NodeJS.Timeout | null = null;
 const UDP_PORT = 43222;
 let activePairingSocket: any = null;
+let pendingPairingTarget: { ip: string; machineId: string; hostname: string } | null = null;
+
+// State
+let win: BrowserWindow | null = null;
+let tray: Tray | null = null;
+let io: Server | null = null;
+let lastClipboardText = readBestClipboardText();
+let isQuitting = false;
+let syncKey = 'CodebLink-Default-Key';
+const pollListeners = new Set<(text: string) => void>();
+
+// 📦 GHOST VAULT: Holds the last message for 60s for phones "between" polls
+let ghostVault: { content: string; timestamp: number } | null = null;
+
+// 📁 PENDING DOWNLOADS: token → file path, expires after 10 minutes
+const pendingDownloads = new Map<string, { filePath: string; expires: number }>();
 
 // Internal bus: when clipboard changes, tell all long-polling background clients
 ghostBus.on('broadcast', (text: string) => {
@@ -128,18 +90,38 @@ const trayIconPath = path.join(__dirname, 'icon.png');
 const windowIconPath = path.join(__dirname, 'icon.ico');
 const VITE_DEV_SERVER_URL = process.env['VITE_DEV_SERVER_URL'];
 
-// ─── showMainWindow ───────────────────────────────────────────────────────
+// ─── showMainWindow (workspace-shift trick) ──────────────────────────────
 function showMainWindow() {
   if (!win || win.isDestroyed()) {
     createWindow();
     return;
   }
 
-  if (win.isMinimized()) win.restore();
+  const wasVisible = win.isVisible();
+
+  // If visible on another workspace, hide first so it re-appears on the
+  // CURRENT workspace
+  if (wasVisible) {
+    win.hide();
+  }
+
+  if (win.isMinimized()) {
+    win.restore();
+  }
+
+  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   win.show();
   win.moveTop();
   win.focus();
+
+  // Unpin after it's safely shown on the current workspace
+  setTimeout(() => {
+    if (win && !win.isDestroyed()) {
+      win.setVisibleOnAllWorkspaces(false, { visibleOnFullScreen: true });
+    }
+  }, 300);
 }
+
 
 // ─── Single Instance Lock ────────────────────────────────────────────────
 const gotLock = app.requestSingleInstanceLock();
@@ -159,6 +141,86 @@ if (!gotLock) {
     startClipboardPolling();
     startUdpDiscovery();
   });
+}
+
+function loadConfig() {
+  try {
+    configPath = path.join(app.getPath('userData'), 'config.json');
+    if (fs.existsSync(configPath)) {
+      const data = fs.readFileSync(configPath, 'utf8');
+      config = JSON.parse(data);
+    }
+  } catch (e) {
+    console.error('Failed to load config:', e);
+  }
+
+  if (!config.machineId) {
+    config.machineId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
+    saveConfig();
+  }
+  if (!config.pairedDevices) {
+    config.pairedDevices = [];
+    saveConfig();
+  }
+}
+
+function saveConfig() {
+  try {
+    if (configPath) {
+      fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+    }
+  } catch (e) {
+    console.error('Failed to save config:', e);
+  }
+}
+
+function setupAutoUpdater() {
+  const isDev = !app.isPackaged || !!VITE_DEV_SERVER_URL;
+  if (isDev) return;
+
+  autoUpdater.autoDownload = true;   // download silently in background
+  autoUpdater.autoInstallOnAppQuit = true; // install on next quit
+
+  const send = (channel: string, data: any) => {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send(channel, data);
+    }
+  };
+
+  autoUpdater.on('checking-for-update', () => {
+    send('updater:status', { status: 'checking' });
+  });
+
+  autoUpdater.on('update-available', (info) => {
+    send('updater:status', { status: 'available', version: info.version });
+  });
+
+  autoUpdater.on('update-not-available', () => {
+    send('updater:status', { status: 'uptodate' });
+  });
+
+  autoUpdater.on('download-progress', (progress) => {
+    send('updater:status', {
+      status: 'downloading',
+      percent: Math.round(progress.percent),
+      transferred: progress.transferred,
+      total: progress.total,
+    });
+  });
+
+  autoUpdater.on('update-downloaded', (info) => {
+    config.lastUpdated = new Date().toISOString();
+    saveConfig();
+    send('updater:status', { status: 'downloaded', version: info.version });
+  });
+
+  autoUpdater.on('error', (err) => {
+    send('updater:status', { status: 'error', message: err.message });
+  });
+
+  // Check immediately on launch, then every 2 hours
+  autoUpdater.checkForUpdates();
+  setInterval(() => autoUpdater.checkForUpdates(), 2 * 60 * 60 * 1000);
 }
 
 // ─── Window ──────────────────────────────────────────────────────────────
@@ -186,6 +248,10 @@ function createWindow() {
 
   win.once('ready-to-show', () => {
     if (win) {
+      if (process.platform === 'linux' && fs.existsSync(trayIconPath)) {
+        const { nativeImage } = require('electron');
+        win.setIcon(nativeImage.createFromPath(trayIconPath));
+      }
       win.maximize();
       win.show();
     }
@@ -205,9 +271,6 @@ function createWindow() {
 
   if (VITE_DEV_SERVER_URL) {
     win.loadURL(VITE_DEV_SERVER_URL);
-    if (process.env.NODE_ENV !== 'production') {
-      win.webContents.openDevTools();
-    }
   } else {
     // __dirname is dist-electron/ inside the asar; dist/ is one level up at asar root
     win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
@@ -221,6 +284,7 @@ function createTray() {
     return;
   }
   try {
+    const { nativeImage } = require('electron');
     const image = nativeImage.createFromPath(trayIconPath);
 
     if (image.isEmpty()) {
@@ -229,7 +293,8 @@ function createTray() {
     }
 
     // Windows system tray icon — 16×16 renders cleanly in the notification area
-    const trayImage = image.resize({ width: 16, height: 16 });
+    const size = process.platform === 'win32' ? 16 : 22;
+    const trayImage = image.resize({ width: size, height: size });
     tray = new Tray(trayImage);
 
     const contextMenu = Menu.buildFromTemplate([
@@ -251,14 +316,34 @@ function createTray() {
     tray.setToolTip('Codeb Link');
     tray.setContextMenu(contextMenu);
 
-    // Double-click → open window
+    const closeTrayMenuSoon = () => {
+      setTimeout(() => { if (tray) tray.closeContextMenu(); }, 0);
+    };
+
+    // Left click → open window on current workspace
+    tray.on('click', (event: any) => {
+      const button = event && event.button;
+      if (button === 2 || button === 'right') return;
+      showMainWindow();
+      closeTrayMenuSoon();
+    });
+
+    // Double-click → open window (Windows-specific fallback)
     tray.on('double-click', () => {
       showMainWindow();
     });
 
-    // Right-click → context menu
+    // Right click → show context menu
     tray.on('right-click', () => {
       tray!.popUpContextMenu(contextMenu);
+    });
+
+    // GNOME extensions may emit only mouse-up for secondary click
+    tray.on('mouse-up', (event: any) => {
+      const button = event && event.button;
+      if (button === 2 || button === 'right') {
+        tray!.popUpContextMenu(contextMenu);
+      }
     });
 
   } catch (e) {
@@ -270,7 +355,27 @@ let ghostLastSeen = 0;
 let lastReportedMode: 'socket' | 'ghost' | 'none' = 'none';
 
 function updateOverallStatus() {
-  const isSocketConnected = io ? io.sockets.sockets.size > 0 : false;
+  const hasPaired = config.pairedDevices && config.pairedDevices.length > 0;
+  if (!hasPaired) {
+    ghostLastSeen = 0;
+    lastReportedMode = 'none';
+    win?.webContents.send('overall-connection-status', {
+      connected: false,
+      mode: 'none'
+    });
+    win?.webContents.send('client-connection-status', { connected: false });
+    return;
+  }
+
+  let isSocketConnected = false;
+  if (io) {
+    for (const [_, socket] of io.sockets.sockets) {
+      if (socket.data && socket.data.isAuthenticated) {
+        isSocketConnected = true;
+        break;
+      }
+    }
+  }
   const isGhostActive = (Date.now() - ghostLastSeen) < 40000;
 
   let currentMode: 'socket' | 'ghost' | 'none' = 'none';
@@ -283,6 +388,9 @@ function updateOverallStatus() {
       connected: currentMode !== 'none',
       mode: currentMode
     });
+    if (currentMode === 'none') {
+      win?.webContents.send('client-connection-status', { connected: false });
+    }
   }
 }
 
@@ -294,6 +402,13 @@ function startSocketServer() {
   const server = http.createServer((req: http.IncomingMessage, res: http.ServerResponse) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
 
+    // ── GET /api/ping ────────────────────────────────────────────────────
+    if (req.method === 'GET' && req.url === '/api/ping') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ app: 'codeblink', hostname: os.hostname(), machineId: config.machineId }));
+      return;
+    }
+
     // ── POST /api/clipboard  (Android → PC) ──────────────────────────────
     if (req.method === 'POST' && req.url === '/api/clipboard') {
       ghostLastSeen = Date.now();
@@ -303,11 +418,34 @@ function startSocketServer() {
       req.on('end', () => {
         try {
           const { data } = JSON.parse(body);
-          const bytes = CryptoJS.AES.decrypt(data, syncKey);
-          const text = bytes.toString(CryptoJS.enc.Utf8);
+
+          let text = '';
+          const senderIp = req.socket.remoteAddress?.replace('::ffff:', '') || '';
+
+          // First try the device with the matching IP
+          const matchedDevice = config.pairedDevices.find(d => d.lastKnownIp === senderIp);
+          if (matchedDevice) {
+            try {
+              const bytes = CryptoJS.AES.decrypt(data, matchedDevice.secretKey);
+              text = bytes.toString(CryptoJS.enc.Utf8);
+            } catch (e) { }
+          }
+
+          // If that failed or no matching IP, try all other keys
+          if (!text) {
+            for (const device of config.pairedDevices) {
+              if (device === matchedDevice) continue;
+              try {
+                const bytes = CryptoJS.AES.decrypt(data, device.secretKey);
+                text = bytes.toString(CryptoJS.enc.Utf8);
+                if (text) break;
+              } catch (e) { }
+            }
+          }
+
           if (text && text !== lastClipboardText) {
             lastClipboardText = text;
-            clipboard.writeText(text);
+            writeSystemClipboard(text);
             win?.webContents.send('clipboard-received', text);
             process.stdout.write(`\r📋 [BG Sync] Clipboard received from Android\n`);
           }
@@ -368,7 +506,7 @@ function startSocketServer() {
       // Hold connection open until clipboard changes or 25s timeout
       const timeoutId = setTimeout(() => {
         if (!res.writableEnded) {
-          res.writeHead(204); // No content — tell phone to re-poll immediately
+          res.writeHead(204); // No content
           res.end();
         }
       }, 25000);
@@ -396,8 +534,6 @@ function startSocketServer() {
         res.end('Not found');
         return;
       }
-      // Consume the token immediately — any concurrent or subsequent request for
-      // the same token gets a 404, preventing duplicate downloads.
       pendingDownloads.delete(token);
       try {
         const stat = fs.statSync(entry.filePath);
@@ -415,7 +551,6 @@ function startSocketServer() {
       }
       return;
 
-      // ── Everything else: let socket.io handle ────────────────────────────
     } else if (!req.url?.startsWith('/socket.io')) {
       res.writeHead(404);
       res.end();
@@ -434,30 +569,91 @@ function startSocketServer() {
 
   io.on('connection', (socket: any) => {
     console.log('📱 Socket connected:', socket.id);
-    win?.webContents.send('device-connected', socket.id);
 
-    // Initial clipboard sync for Android (default key)
-    // For PCs, a fresh sync is sent after successful identify or pairing acceptance.
-    const freshText = clipboard.readText() || '';
-    if (freshText) {
-      lastClipboardText = freshText;
-      const encrypted = CryptoJS.AES.encrypt(freshText, syncKey).toString();
-      socket.emit('clipboard-received', encrypted);
-    }
+    // Android device announcing itself for discovery/pairing
+    socket.on('announce-device', (data: { machineId: string; hostname: string; device: 'android' }) => {
+      const { machineId, hostname, device } = data;
+      if (!machineId || device !== 'android') return;
 
-    // Identify handler (for Windows-to-Windows connection)
+      const clientIp = socket.handshake.address.replace('::ffff:', '');
+      console.log(`📲 Android device announced: ${hostname} @ ${clientIp} (ID: ${machineId})`);
+
+      socket.data.machineId = machineId;
+      socket.data.hostname = hostname;
+      socket.data.device = 'android';
+
+      // Add/update in discoveredPcs map
+      discoveredPcs.set(clientIp, {
+        hostname: hostname || 'Android Device',
+        ip: clientIp,
+        port: 4321,
+        machineId,
+        lastSeen: Date.now(),
+        device: 'android'
+      });
+      sendDiscoveredPcs();
+
+      // Check if already paired
+      const paired = config.pairedDevices.find(d => d.machineId === machineId);
+      if (paired) {
+        // Auto-authenticate the paired socket
+        socket.data.secretKey = paired.secretKey;
+        socket.data.isAuthenticated = true;
+        paired.lastKnownIp = clientIp;
+        saveConfig();
+        console.log(`📲 Android device auto-authenticated: ${hostname}`);
+        win?.webContents.send('device-connected', socket.id);
+
+        // Sync clipboard immediately
+        const currentText = readBestClipboardText();
+        if (currentText) {
+          const encrypted = CryptoJS.AES.encrypt(currentText, paired.secretKey).toString();
+          socket.emit('clipboard-received', encrypted);
+        }
+      } else if (pendingPairingTarget && pendingPairingTarget.machineId === machineId) {
+        const target = pendingPairingTarget;
+        pendingPairingTarget = null;
+
+        // Generate pairing code + shared secret key
+        const pairingCode = String(Math.floor(100000 + Math.random() * 900000));
+        const secretKey = crypto.randomBytes(32).toString('hex');
+
+        socket.data.pairingData = { machineId, hostname: target.hostname, pairingCode, secretKey };
+        socket.data.device = 'android';
+        activePairingSocket = socket;
+
+        // Tell Android to show the pairing code
+        socket.emit('initiate-pairing', {
+          pairingCode,
+          secretKey,
+          pcHostname: os.hostname(),
+          pcMachineId: config.machineId
+        });
+
+        // Show UI pairing popup
+        win?.webContents.send('show-pairing-popup', {
+          pairingCode,
+          remoteHostname: target.hostname,
+          remoteIp: clientIp,
+          isInitiator: true
+        });
+        console.log(`[Android] Initiated pairing with ${target.hostname} after auto-connection — code: ${pairingCode}`);
+      }
+    });
+
+    // Identify handler (for PC-to-PC connection)
     socket.on('identify', (data: { machineId: string; hostname: string; signature?: string }) => {
       const { machineId, hostname, signature } = data;
       if (!machineId) {
         socket.disconnect();
         return;
       }
-      
+
       socket.data.machineId = machineId;
       socket.data.hostname = hostname;
-      
+
       console.log(`[Handshake] Received identify from ${hostname} (ID: ${machineId})`);
-      
+
       const paired = config.pairedDevices.find(d => d.machineId === machineId);
       if (paired) {
         if (signature) {
@@ -469,49 +665,45 @@ function startSocketServer() {
               const payload = JSON.parse(decryptedStr);
               const timeDiff = Math.abs(Date.now() - payload.timestamp);
               console.log(`[Handshake] Decrypted signature successfully. Payload machineId: ${payload.machineId}, timestamp diff: ${timeDiff}ms`);
-              
+
               // Verify machineId matches and allow up to 24 hours of clock drift/skew
               if (payload.machineId === machineId && timeDiff < 86400000) {
                 console.log(`[Handshake] Client signature verified successfully.`);
-                
+
                 socket.data.secretKey = paired.secretKey;
                 socket.data.isAuthenticated = true;
-                
+
                 const clientIp = socket.handshake.address.replace('::ffff:', '');
                 if (paired.lastKnownIp !== clientIp) {
                   paired.lastKnownIp = clientIp;
                   saveConfig();
                 }
-                
+
                 socket.emit('identify-ack', { status: 'paired' });
-                
+
                 win?.webContents.send('client-connection-status', {
                   connected: true,
                   ip: clientIp,
                   hostname: hostname
                 });
-                
+
                 // Sync clipboard immediately
-                const currentText = clipboard.readText() || '';
+                const currentText = readBestClipboardText();
                 if (currentText) {
                   const encrypted = CryptoJS.AES.encrypt(currentText, paired.secretKey).toString();
                   socket.emit('clipboard-received', encrypted);
                 }
-                
+
                 return;
               } else {
-                console.warn(`[Handshake] Verification conditions failed: machineId match = ${payload.machineId === machineId}, timeDiff within 24h = ${timeDiff < 86400000}`);
+                console.warn(`[Handshake] Verification conditions failed`);
               }
-            } else {
-              console.warn(`[Handshake] Decrypted signature string is empty. Key might be wrong or corrupt.`);
             }
           } catch (e) {
             console.error('[Handshake] Verification exception:', e);
           }
-        } else {
-          console.warn(`[Handshake] Client is paired but sent no signature.`);
         }
-        
+
         console.warn(`[Handshake] Authentication failed. Disconnecting ${hostname}`);
         socket.emit('identify-ack', { status: 'unauthorized' });
         socket.disconnect();
@@ -528,10 +720,52 @@ function startSocketServer() {
         socket.disconnect();
         return;
       }
-      
+
+      // Check if Windows was the initiator for this socket (Android is accepting back)
+      if (activePairingSocket === socket &&
+        socket.data.pairingData &&
+        socket.data.pairingData.pairingCode === pairingCode) {
+        console.log(`[Pairing] Android accepted Windows-initiated pairing from ${hostname}. Auto-completing.`);
+        const clientIp = socket.handshake.address.replace('::ffff:', '');
+
+        const newEntry = { machineId, hostname, secretKey, lastKnownIp: clientIp };
+        const existingIndex = config.pairedDevices.findIndex(d => d.machineId === machineId);
+        if (existingIndex > -1) {
+          config.pairedDevices[existingIndex] = newEntry;
+        } else {
+          config.pairedDevices.push(newEntry);
+        }
+        saveConfig();
+
+        socket.data.secretKey = secretKey;
+        socket.data.isAuthenticated = true;
+        win?.webContents.send('device-connected', socket.id);
+        socket.emit('pairing-response', {
+          status: 'accepted',
+          machineId: config.machineId,
+          hostname: os.hostname()
+        });
+
+        // Dismiss pairing popup
+        win?.webContents.send('hide-pairing-popup');
+
+        // Sync clipboard immediately
+        const currentText = readBestClipboardText() || '';
+        if (currentText) {
+          const encrypted = CryptoJS.AES.encrypt(currentText, secretKey).toString();
+          socket.emit('clipboard-received', encrypted);
+        }
+
+        activePairingSocket = null;
+        sendDiscoveredPcs();
+        sendPairingState();
+        return;
+      }
+
+      // Standard flow: a remote device (PC or Android) is initiating pairing unprompted
       socket.data.pairingData = data;
       activePairingSocket = socket;
-      
+
       const clientIp = socket.handshake.address.replace('::ffff:', '');
       win?.webContents.send('show-pairing-popup', {
         pairingCode,
@@ -541,16 +775,23 @@ function startSocketServer() {
       });
     });
 
+    // Android user cancelled pairing from their device
+    socket.on('request-pairing-reject', () => {
+      if (activePairingSocket === socket) {
+        activePairingSocket = null;
+        win?.webContents.send('hide-pairing-popup');
+        console.log(`[Pairing] Android cancelled pairing`);
+      }
+    });
+
     socket.on('sync-key', (key: string, ack?: (result: { ok: boolean; keyId?: string }) => void) => {
       const incoming = typeof key === 'string' ? key : '';
       if (incoming.length > 0) {
         syncKey = incoming;
         const keyId = CryptoJS.MD5(syncKey).toString().slice(0, 8);
         console.log(`🔑 Sync key updated from phone session (id=${keyId})`);
-        win?.webContents.send('sync-key-updated', syncKey);
         ack?.({ ok: true, keyId });
-        // After key sync, send the latest clipboard snapshot immediately
-        const current = clipboard.readText() || '';
+        const current = readBestClipboardText();
         if (current) {
           const encrypted = CryptoJS.AES.encrypt(current, syncKey).toString();
           socket.emit('clipboard-received', encrypted);
@@ -561,14 +802,17 @@ function startSocketServer() {
     });
 
     socket.on('clipboard-update', (encryptedData: string) => {
+      if (!socket.data.isAuthenticated || !socket.data.secretKey) {
+        console.warn(`[Security] Ignored clipboard-update from unauthenticated socket: ${socket.id}`);
+        return;
+      }
       try {
-        const decryptKey = socket.data.secretKey || syncKey;
-        const bytes = CryptoJS.AES.decrypt(encryptedData, decryptKey);
+        const bytes = CryptoJS.AES.decrypt(encryptedData, socket.data.secretKey);
         const data = bytes.toString(CryptoJS.enc.Utf8);
 
         if (data && data !== lastClipboardText) {
           lastClipboardText = data;
-          clipboard.writeText(data);
+          writeSystemClipboard(data);
           win?.webContents.send('clipboard-received', data);
 
           // Relay to client socket if connected
@@ -583,6 +827,11 @@ function startSocketServer() {
     });
 
     socket.on('file-received', (fileData: FilePayload, ack?: (result: { ok: boolean; name?: string; error?: string }) => void) => {
+      if (!socket.data.isAuthenticated) {
+        console.warn(`[Security] Ignored file-received from unauthenticated socket: ${socket.id}`);
+        ack?.({ ok: false, error: 'Unauthorized' });
+        return;
+      }
       try {
         const downloadsPath = path.join(os.homedir(), 'Downloads');
         if (!fs.existsSync(downloadsPath)) fs.mkdirSync(downloadsPath, { recursive: true });
@@ -636,11 +885,20 @@ function startSocketServer() {
     });
 
     socket.on('unpaired-by-peer', (data: { machineId: string }) => {
-      console.log(`[Unpair] Received unpaired-by-peer from remote client: ${data.machineId}`);
-      config.pairedDevices = config.pairedDevices.filter(d => d.machineId !== data.machineId);
+      const targetId = socket.data?.machineId || data.machineId;
+      console.log(`[Unpair] Received unpaired-by-peer from remote client: targetId=${targetId}`);
+      config.pairedDevices = config.pairedDevices.filter(d => d.machineId !== targetId);
       saveConfig();
       sendDiscoveredPcs();
       sendPairingState();
+      socket.disconnect();
+      updateOverallStatus();
+    });
+
+    socket.on('client-disconnect', (data: { machineId: string }) => {
+      console.log(`[Disconnect] Received client-disconnect from remote client: ${data.machineId}`);
+      ghostLastSeen = 0;
+      updateOverallStatus();
     });
 
     socket.on('disconnect', () => {
@@ -648,11 +906,12 @@ function startSocketServer() {
         activePairingSocket = null;
         win?.webContents.send('hide-pairing-popup');
       }
-      win?.webContents.send('device-disconnected', socket.id);
-      
       if (socket.data && socket.data.isAuthenticated) {
+        win?.webContents.send('device-disconnected', socket.id);
         win?.webContents.send('client-connection-status', { connected: false });
       }
+      sendDiscoveredPcs();
+      updateOverallStatus();
     });
   });
 
@@ -661,7 +920,6 @@ function startSocketServer() {
   });
 }
 
-// ─── Clipboard Polling ──────────────────────────────────────────────────
 // ─── Clipboard Polling ──────────────────────────────────────────────────
 function startClipboardPolling() {
   setInterval(() => {
@@ -679,7 +937,7 @@ function startClipboardPolling() {
         }
       };
 
-      const text = clipboard.readText() || '';
+      const text = readBestClipboardText();
       if (text && text !== lastClipboardText) {
         broadcastClipboard(text);
       }
@@ -703,7 +961,7 @@ function broadcastToSocketClients(text: string) {
 ipcMain.handle('get-local-ip', () => getLocalIp());
 
 ipcMain.handle('read-local-clipboard', () => {
-  return clipboard.readText() || '';
+  return readBestClipboardText() || '';
 });
 
 ipcMain.on('set-sync-key', (_event: any, key: string) => {
@@ -762,114 +1020,15 @@ ipcMain.on('send-file-to-phone', (_event: any, fileData: FilePayload) => {
   }
 });
 
-// Windows-to-Windows IPC handlers
-ipcMain.on('connect-to-pc', (_event: any, { ip, machineId }: { ip: string; machineId: string }) => {
-  if (!ip) return;
-  connectToRemotePc(ip, machineId || '');
-});
-
-ipcMain.on('disconnect-from-pc', () => {
-  disconnectFromRemotePc();
-});
-
-ipcMain.on('request-discovered-pcs', () => {
-  sendDiscoveredPcs();
-});
-
-ipcMain.on('get-pairing-state', () => {
-  sendPairingState();
-});
-
-ipcMain.on('accept-pairing', () => {
-  if (activePairingSocket && activePairingSocket.data.pairingData) {
-    const { machineId, hostname, secretKey } = activePairingSocket.data.pairingData;
-    const clientIp = activePairingSocket.handshake.address.replace('::ffff:', '');
-    
-    const newEntry = { machineId, hostname, secretKey, lastKnownIp: clientIp };
-    const existingIndex = config.pairedDevices.findIndex(d => d.machineId === machineId);
-    if (existingIndex > -1) {
-      config.pairedDevices[existingIndex] = newEntry;
-    } else {
-      config.pairedDevices.push(newEntry);
-    }
-    saveConfig();
-    
-    activePairingSocket.data.secretKey = secretKey;
-    activePairingSocket.data.isAuthenticated = true;
-    
-    activePairingSocket.emit('pairing-response', {
-      status: 'accepted',
-      machineId: config.machineId,
-      hostname: os.hostname()
-    });
-    
-    win?.webContents.send('hide-pairing-popup');
-    win?.webContents.send('client-connection-status', {
-      connected: true,
-      ip: clientIp,
-      hostname: hostname
-    });
-    
-    const currentText = clipboard.readText() || '';
-    if (currentText) {
-      const encrypted = CryptoJS.AES.encrypt(currentText, secretKey).toString();
-      activePairingSocket.emit('clipboard-received', encrypted);
-    }
-    
-    activePairingSocket = null;
-    sendDiscoveredPcs();
-    sendPairingState();
-  }
-});
-
-ipcMain.on('reject-pairing', () => {
-  if (activePairingSocket) {
-    activePairingSocket.emit('pairing-response', { status: 'rejected' });
-    activePairingSocket.disconnect();
-    activePairingSocket = null;
-  }
-  win?.webContents.send('hide-pairing-popup');
-});
-
-ipcMain.on('cancel-pairing', () => {
-  disconnectFromRemotePc();
-  win?.webContents.send('hide-pairing-popup');
-});
-
-ipcMain.on('unpair-device', (_event, machineId: string) => {
-  config.pairedDevices = config.pairedDevices.filter(d => d.machineId !== machineId);
-  saveConfig();
-  
-  if (clientSocket && clientSocketMachineId === machineId) {
-    console.log(`[Unpair] Emitting unpaired-by-peer to remote host client connection`);
-    clientSocket.emit('unpaired-by-peer', { machineId: config.machineId });
-    disconnectFromRemotePc();
-  }
-  
-  if (io) {
-    const sockets = Array.from(io.sockets.sockets.values()) as any[];
-    for (const socket of sockets) {
-      if (socket.data && socket.data.machineId === machineId) {
-        console.log(`[Unpair] Emitting unpaired-by-peer to remote client socket connection`);
-        socket.emit('unpaired-by-peer', { machineId: config.machineId });
-        socket.disconnect();
-      }
-    }
-  }
-  
-  sendDiscoveredPcs();
-  sendPairingState();
-});
-
-// ─── Windows Client & Discovery Functions ────────────────────────────────
+// ─── PC-to-PC Client & Discovery Functions ────────────────────────────────
 function connectToRemotePc(ip: string, targetMachineId: string) {
   try {
     disconnectFromRemotePc();
 
     currentPairingIp = ip;
-    
+
     const ioClient = require('socket.io-client');
-    
+
     console.log(`Connecting to remote PC at http://${ip}:4321 ...`);
     clientSocket = ioClient(`http://${ip}:4321`, {
       transports: ['websocket'],
@@ -880,13 +1039,13 @@ function connectToRemotePc(ip: string, targetMachineId: string) {
 
     clientSocket.on('connect', () => {
       console.log('Connected to remote PC, validating credentials...');
-      
+
       const paired = config.pairedDevices.find(d => d.machineId === targetMachineId);
       if (paired) {
         console.log(`Authenticating with signature for: ${paired.hostname}`);
         const payload = JSON.stringify({ timestamp: Date.now(), machineId: config.machineId });
         const signature = CryptoJS.AES.encrypt(payload, paired.secretKey).toString();
-        
+
         clientSocket.emit('identify', {
           machineId: config.machineId,
           hostname: os.hostname(),
@@ -910,7 +1069,7 @@ function connectToRemotePc(ip: string, targetMachineId: string) {
           clientSocketHostname = paired.hostname;
           clientConnected = true;
           connectedHostInfo = { hostname: paired.hostname, ip };
-          
+
           win?.webContents.send('client-connection-status', {
             connected: true,
             ip,
@@ -918,7 +1077,7 @@ function connectToRemotePc(ip: string, targetMachineId: string) {
           });
 
           // Send current local clipboard to the host immediately
-          const currentText = clipboard.readText() || '';
+          const currentText = readBestClipboardText() || '';
           if (currentText) {
             const encrypted = CryptoJS.AES.encrypt(currentText, clientSocketSecretKey).toString();
             clientSocket.emit('clipboard-update', encrypted);
@@ -936,9 +1095,9 @@ function connectToRemotePc(ip: string, targetMachineId: string) {
 
         const pairingCode = Math.floor(100000 + Math.random() * 900000).toString();
         const secretKey = crypto.randomBytes(32).toString('hex');
-        
+
         clientSocketSecretKey = secretKey;
-        
+
         win?.webContents.send('show-pairing-popup', {
           pairingCode,
           remoteHostname: 'Remote PC',
@@ -977,12 +1136,12 @@ function connectToRemotePc(ip: string, targetMachineId: string) {
           config.pairedDevices.push(newEntry);
         }
         saveConfig();
-        
+
         clientSocketMachineId = res.machineId;
         clientSocketHostname = res.hostname;
         clientConnected = true;
         connectedHostInfo = { hostname: res.hostname, ip: currentPairingIp };
-        
+
         win?.webContents.send('hide-pairing-popup');
         win?.webContents.send('client-connection-status', {
           connected: true,
@@ -993,7 +1152,7 @@ function connectToRemotePc(ip: string, targetMachineId: string) {
         sendPairingState();
 
         // Send current local clipboard to the host immediately
-        const currentText = clipboard.readText() || '';
+        const currentText = readBestClipboardText() || '';
         if (currentText) {
           const encrypted = CryptoJS.AES.encrypt(currentText, clientSocketSecretKey).toString();
           clientSocket.emit('clipboard-update', encrypted);
@@ -1014,9 +1173,9 @@ function connectToRemotePc(ip: string, targetMachineId: string) {
         const data = bytes.toString(CryptoJS.enc.Utf8);
         if (data && data !== lastClipboardText) {
           lastClipboardText = data;
-          clipboard.writeText(data);
+          writeSystemClipboard(data);
           win?.webContents.send('clipboard-received', data);
-          
+
           // Relay to our own server's clients (Android, etc.)
           broadcastToSocketClients(data);
           ghostBus.emit('broadcast', data);
@@ -1118,19 +1277,59 @@ function startUdpDiscovery() {
     udpSocket.on('message', (msg, rinfo) => {
       try {
         const data = JSON.parse(msg.toString());
-        if (data.app === 'codeblink' && data.ip) {
-          const localIp = getLocalIp();
-          if (data.ip === localIp) return; // Skip ourselves
 
-          discoveredPcs.set(data.ip, {
-            hostname: data.hostname || 'Unknown PC',
-            ip: data.ip,
+        // PC-format packet: { app: 'codeblink', ip, hostname, machineId, port }
+        const isPcPacket = data.app === 'codeblink' && data.ip;
+        // Android-format packet: { type: 'codeb-link-node', device: 'android', hostname, machineId, port }
+        const isAndroidPacket = data.type === 'codeb-link-node' && data.device === 'android';
+
+        if (!isPcPacket && !isAndroidPacket) return;
+
+        // PC sends its own IP in the payload; Android doesn't — use rinfo.address
+        const senderIp: string = isPcPacket ? data.ip : rinfo.address;
+        const localIp = getLocalIp();
+        if (senderIp === localIp) return; // Skip ourselves
+
+        const existingEntry = discoveredPcs.get(senderIp);
+
+        if (isAndroidPacket) {
+          // Update last-seen timestamp but don't downgrade a socket-registered entry
+          if (existingEntry) {
+            existingEntry.lastSeen = Date.now();
+            // Refresh hostname/machineId in case it changed
+            if (data.hostname) existingEntry.hostname = data.hostname;
+            sendDiscoveredPcs();
+            return;
+          }
+          // First time we hear from this Android device via UDP — register it
+          discoveredPcs.set(senderIp, {
+            hostname: data.hostname || 'Android Device',
+            ip: senderIp,
             port: data.port || 4321,
             machineId: data.machineId || '',
-            lastSeen: Date.now()
+            lastSeen: Date.now(),
+            device: 'android'
           });
+          console.log(`📲 Android device discovered via UDP: ${data.hostname} @ ${senderIp}`);
           sendDiscoveredPcs();
+          return;
         }
+
+        // PC packet
+        if (existingEntry && existingEntry.device === 'android') {
+          existingEntry.lastSeen = Date.now();
+          return;
+        }
+
+        discoveredPcs.set(senderIp, {
+          hostname: data.hostname || 'Unknown PC',
+          ip: senderIp,
+          port: data.port || 4321,
+          machineId: data.machineId || '',
+          lastSeen: Date.now(),
+          device: process.platform === 'win32' ? 'windows' : 'linux'
+        });
+        sendDiscoveredPcs();
       } catch (e) {
         // Ignore malformed packets
       }
@@ -1173,15 +1372,29 @@ function startUdpDiscovery() {
 function sendDiscoveredPcs() {
   const list = Array.from(discoveredPcs.values()).map(p => {
     const isPaired = config.pairedDevices.some(d => d.machineId === p.machineId);
+    let isConnected = false;
+    if (p.device === 'android' && io) {
+      const sockets = Array.from(io.sockets.sockets.values()) as any[];
+      isConnected = sockets.some(s => s.data && s.data.machineId === p.machineId);
+    }
     return {
       hostname: p.hostname,
       ip: p.ip,
       port: p.port,
       machineId: p.machineId,
-      isPaired
+      isPaired,
+      isConnected,
+      device: p.device || 'windows'
     };
   });
   win?.webContents.send('discovered-pcs', list);
+}
+
+function sendPairingState() {
+  win?.webContents.send('pairing-state-updated', {
+    machineId: config.machineId,
+    pairedDevices: config.pairedDevices
+  });
 }
 
 // Clean up dead nodes periodically
@@ -1189,6 +1402,18 @@ setInterval(() => {
   let changed = false;
   const now = Date.now();
   for (const [ip, pc] of discoveredPcs.entries()) {
+    // Check if the device is currently connected via Socket.io
+    let isSocketConnected = false;
+    if (io) {
+      const sockets = Array.from(io.sockets.sockets.values()) as any[];
+      isSocketConnected = sockets.some(s => s.data && s.data.machineId === pc.machineId);
+    }
+
+    if (isSocketConnected) {
+      pc.lastSeen = now; // Keep it alive
+      continue;
+    }
+
     if (now - pc.lastSeen > 10000) {
       discoveredPcs.delete(ip);
       changed = true;
@@ -1199,19 +1424,194 @@ setInterval(() => {
   }
 }, 5000);
 
-// ─── Helpers ─────────────────────────────────────────────────────────────
+// PC-to-PC / Android IPC handlers
+ipcMain.on('connect-to-pc', (_event: any, { ip, machineId }: { ip: string; machineId: string }) => {
+  if (!ip) return;
+
+  const discoveredEntry = discoveredPcs.get(ip);
+  if (discoveredEntry && discoveredEntry.device === 'android') {
+    if (io) {
+      const sockets = Array.from(io.sockets.sockets.values()) as any[];
+      const androidSocket = sockets.find(s => s.data && s.data.machineId === machineId && s.data.device === 'android');
+      if (androidSocket) {
+        const paired = config.pairedDevices.find(d => d.machineId === machineId);
+        if (paired) {
+          console.log(`[Android] Already paired with ${discoveredEntry.hostname}. Ensuring auth.`);
+          return;
+        }
+        // Generate pairing code + shared secret key
+        const pairingCode = String(Math.floor(100000 + Math.random() * 900000));
+        const secretKey = crypto.randomBytes(32).toString('hex');
+
+        androidSocket.data.pairingData = { machineId, hostname: discoveredEntry.hostname, pairingCode, secretKey };
+        androidSocket.data.device = 'android';
+        activePairingSocket = androidSocket;
+
+        // Tell Android to show the pairing code
+        androidSocket.emit('initiate-pairing', {
+          pairingCode,
+          secretKey,
+          pcHostname: os.hostname(),
+          pcMachineId: config.machineId
+        });
+
+        // Show UI pairing popup
+        win?.webContents.send('show-pairing-popup', {
+          pairingCode,
+          remoteHostname: discoveredEntry.hostname,
+          remoteIp: ip,
+          isInitiator: true
+        });
+        console.log(`[Android] Initiated pairing with ${discoveredEntry.hostname} — code: ${pairingCode}`);
+        return;
+      } else {
+        // No socket connection exists yet — set pendingPairingTarget and send UDP unicast command to phone
+        pendingPairingTarget = { ip, machineId, hostname: discoveredEntry.hostname };
+        console.log(`[Android] Sending UDP connect request to ${ip} on port 43222`);
+        const message = Buffer.from(JSON.stringify({
+          type: 'codeb-link-action',
+          action: 'connect-to-pc',
+          serverIp: getLocalIp() || '127.0.0.1'
+        }));
+        udpSocket?.send(message, 0, message.length, UDP_PORT, ip);
+        return;
+      }
+    }
+  }
+
+  // PC-to-PC connect as a client
+  connectToRemotePc(ip, machineId || '');
+});
+
+ipcMain.on('disconnect-from-pc', () => {
+  disconnectFromRemotePc();
+});
+
+ipcMain.on('disconnect-android', (_event, machineId: string) => {
+  if (io) {
+    const sockets = Array.from(io.sockets.sockets.values()) as any[];
+    for (const socket of sockets) {
+      if (socket.data && socket.data.machineId === machineId) {
+        console.log(`[Disconnect] Manually disconnecting Android socket: ${machineId}`);
+        socket.emit('force-disconnect');
+        setTimeout(() => socket.disconnect(), 300);
+      }
+    }
+  }
+  ghostLastSeen = 0;
+  updateOverallStatus();
+  sendDiscoveredPcs();
+});
+
+ipcMain.on('request-discovered-pcs', () => {
+  sendDiscoveredPcs();
+});
+
+ipcMain.on('get-pairing-state', () => {
+  sendPairingState();
+});
+
+ipcMain.on('accept-pairing', () => {
+  if (activePairingSocket && activePairingSocket.data.pairingData) {
+    const { machineId, hostname, secretKey } = activePairingSocket.data.pairingData;
+    const clientIp = activePairingSocket.handshake.address.replace('::ffff:', '');
+    const deviceType = activePairingSocket.data.device || 'windows';
+
+    const newEntry = { machineId, hostname, secretKey, lastKnownIp: clientIp };
+    const existingIndex = config.pairedDevices.findIndex(d => d.machineId === machineId);
+    if (existingIndex > -1) {
+      config.pairedDevices[existingIndex] = newEntry;
+    } else {
+      config.pairedDevices.push(newEntry);
+    }
+    saveConfig();
+
+    activePairingSocket.data.secretKey = secretKey;
+    activePairingSocket.data.isAuthenticated = true;
+
+    activePairingSocket.emit('pairing-response', {
+      status: 'accepted',
+      machineId: config.machineId,
+      hostname: os.hostname()
+    });
+
+    win?.webContents.send('hide-pairing-popup');
+
+    if (deviceType === 'android') {
+      win?.webContents.send('device-connected', activePairingSocket.id);
+    } else {
+      win?.webContents.send('client-connection-status', {
+        connected: true,
+        ip: clientIp,
+        hostname: hostname
+      });
+    }
+
+    const currentText = readBestClipboardText() || '';
+    if (currentText) {
+      const encrypted = CryptoJS.AES.encrypt(currentText, secretKey).toString();
+      activePairingSocket.emit('clipboard-received', encrypted);
+    }
+
+    activePairingSocket = null;
+    sendDiscoveredPcs();
+    sendPairingState();
+  }
+});
+
+ipcMain.on('reject-pairing', () => {
+  if (activePairingSocket) {
+    activePairingSocket.emit('pairing-response', { status: 'rejected' });
+    activePairingSocket.disconnect();
+    activePairingSocket = null;
+  }
+  win?.webContents.send('hide-pairing-popup');
+});
+
+ipcMain.on('cancel-pairing', () => {
+  disconnectFromRemotePc();
+  win?.webContents.send('hide-pairing-popup');
+});
+
+ipcMain.on('unpair-device', (_event, machineId: string) => {
+  config.pairedDevices = config.pairedDevices.filter(d => d.machineId !== machineId);
+  saveConfig();
+
+  if (clientSocket && clientSocketMachineId === machineId) {
+    console.log(`[Unpair] Emitting unpaired-by-peer to remote host client connection`);
+    clientSocket.emit('unpaired-by-peer', { machineId: config.machineId });
+    disconnectFromRemotePc();
+  }
+
+  if (io) {
+    const sockets = Array.from(io.sockets.sockets.values()) as any[];
+    for (const socket of sockets) {
+      if (socket.data && socket.data.machineId === machineId) {
+        console.log(`[Unpair] Emitting unpaired-by-peer to remote client socket connection`);
+        socket.emit('unpaired-by-peer', { machineId: config.machineId });
+        setTimeout(() => socket.disconnect(), 300);
+      }
+    }
+  }
+
+  ghostLastSeen = 0;
+  updateOverallStatus();
+  sendDiscoveredPcs();
+  sendPairingState();
+});
+
 function getLocalIp(): string {
   const interfaces = os.networkInterfaces();
   const ips: { address: string, isVirtual: boolean, is192: boolean, is10: boolean }[] = [];
 
   for (const name of Object.keys(interfaces)) {
-    const isVirtual = name.toLowerCase().includes('veth') || 
-                      name.toLowerCase().includes('vmware') || 
-                      name.toLowerCase().includes('virtual') || 
-                      name.toLowerCase().includes('tailscale') ||
-                      name.toLowerCase().includes('zerotier') ||
-                      name.toLowerCase().includes('wsl');
-    
+    const isVirtual = name.toLowerCase().includes('veth') ||
+      name.toLowerCase().includes('vmware') ||
+      name.toLowerCase().includes('virtual') ||
+      name.toLowerCase().includes('tailscale') ||
+      name.toLowerCase().includes('zerotier') ||
+      name.toLowerCase().includes('wsl');
+
     const net = interfaces[name];
     if (net) {
       for (const iface of net) {
@@ -1227,7 +1627,6 @@ function getLocalIp(): string {
     }
   }
 
-  // Sort: 192.168 non-virtual first, then 10. non-virtual, then other non-virtual, then virtual
   ips.sort((a, b) => {
     if (a.isVirtual !== b.isVirtual) return a.isVirtual ? 1 : -1;
     if (a.is192 !== b.is192) return a.is192 ? -1 : 1;
@@ -1238,94 +1637,85 @@ function getLocalIp(): string {
   return ips.length > 0 ? ips[0].address : '127.0.0.1';
 }
 
-function sanitizeFileName(name: string): string {
-  // Remove Windows-illegal characters and path traversal attempts
-  return name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/^\.+/, '_').slice(0, 255);
-}
-
-function resolveUniqueFilePath(dir: string, name: string): string {
-  const ext = path.extname(name);
-  const base = path.basename(name, ext);
-  let candidate = path.join(dir, name);
-  let counter = 1;
-  while (fs.existsSync(candidate)) {
-    candidate = path.join(dir, `${base} (${counter})${ext}`);
-    counter++;
-  }
-  return candidate;
-}
-
-// ─── Auto Updater ─────────────────────────────────────────────────────────────
-const isDev = !app.isPackaged;
-
-function setupAutoUpdater() {
-  // In dev mode skip update checks entirely
-  if (isDev) return;
-
-  autoUpdater.autoDownload = true;   // download silently in background
-  autoUpdater.autoInstallOnAppQuit = true; // install on next quit
-
-  const send = (channel: string, data: any) => {
-    if (win && !win.isDestroyed()) {
-      win.webContents.send(channel, data);
-    }
-  };
-
-  autoUpdater.on('checking-for-update', () => {
-    send('updater:status', { status: 'checking' });
-  });
-
-  autoUpdater.on('update-available', (info) => {
-    send('updater:status', { status: 'available', version: info.version });
-  });
-
-  autoUpdater.on('update-not-available', () => {
-    send('updater:status', { status: 'uptodate' });
-  });
-
-  autoUpdater.on('download-progress', (progress) => {
-    send('updater:status', {
-      status: 'downloading',
-      percent: Math.round(progress.percent),
-      transferred: progress.transferred,
-      total: progress.total,
+function tryReadCommand(command: string): string {
+  try {
+    const output = execSync(command, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 500,
+      maxBuffer: 1024 * 1024,
     });
-  });
-
-  autoUpdater.on('update-downloaded', (info) => {
-    config.lastUpdated = new Date().toISOString();
-    saveConfig();
-    send('updater:status', { status: 'downloaded', version: info.version });
-  });
-
-  autoUpdater.on('error', (err) => {
-    send('updater:status', { status: 'error', message: err.message });
-  });
-
-  // Check immediately on launch, then every 2 hours
-  autoUpdater.checkForUpdates();
-  setInterval(() => autoUpdater.checkForUpdates(), 2 * 60 * 60 * 1000);
+    return output.trim();
+  } catch {
+    return '';
+  }
 }
 
-// Allow renderer to trigger install-and-restart
-ipcMain.on('updater:install', () => {
+function writeSystemClipboard(text: string): void {
+  clipboard.writeText(text);
+  if (process.platform !== 'linux') return;
+  const r = spawnSync('wl-copy', [], {
+    input: text,
+    encoding: 'utf8',
+    timeout: 1000,
+    stdio: ['pipe', 'ignore', 'ignore'],
+  });
+  if (r.status !== 0) {
+    spawnSync('xclip', ['-selection', 'clipboard'], {
+      input: text,
+      encoding: 'utf8',
+      timeout: 1000,
+      stdio: ['pipe', 'ignore', 'ignore'],
+    });
+  }
+}
+
+function readBestClipboardText(): string {
+  if (process.platform === 'linux') {
+    const wl = tryReadCommand('wl-paste -n');
+    if (wl) return wl;
+
+    const xclip = tryReadCommand('xclip -selection clipboard -o');
+    if (xclip) return xclip;
+
+    const xsel = tryReadCommand('xsel --clipboard --output');
+    if (xsel) return xsel;
+  }
+
+  return clipboard.readText('clipboard').trim();
+}
+
+function sanitizeFileName(name: string): string {
+  const cleaned = name.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim();
+  return cleaned || `shared_${Date.now()}`;
+}
+
+function resolveUniqueFilePath(dir: string, fileName: string): string {
+  const ext = path.extname(fileName);
+  const base = ext ? fileName.slice(0, -ext.length) : fileName;
+  let n = 0;
+  while (true) {
+    const candidateName = n === 0 ? `${base}${ext}` : `${base} (${n})${ext}`;
+    const candidatePath = path.join(dir, candidateName);
+    if (!fs.existsSync(candidatePath)) return candidatePath;
+    n += 1;
+  }
+}
+
+// ─── App Lifecycle ────────────────────────────────────────────────────────
+app.on('before-quit', () => {
   isQuitting = true;
-  autoUpdater.quitAndInstall(true, true);
+  if (tray) tray.destroy();
 });
 
-// Allow renderer to manually trigger a check
-ipcMain.handle('updater:check', () => {
-  if (isDev) return { status: 'dev' };
-  autoUpdater.checkForUpdates();
-  return { status: 'checking' };
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    // Keep alive for tray
+  }
 });
 
-ipcMain.handle('app:getInfo', () => {
-  return {
-    version: app.getVersion(),
-    lastUpdated: config.lastUpdated ?? null,
-    platform: process.platform,
-  };
+app.on('activate', () => {
+  if (win === null) createWindow();
 });
 
 // Allow renderer to control window states
@@ -1351,3 +1741,24 @@ ipcMain.handle('window:isMaximized', () => {
   return win?.isMaximized() ?? false;
 });
 
+ipcMain.handle('app:getInfo', () => {
+  return {
+    version: app.getVersion(),
+    lastUpdated: config.lastUpdated ?? null,
+    platform: process.platform,
+  };
+});
+
+// Allow renderer to trigger install-and-restart
+ipcMain.on('updater:install', () => {
+  isQuitting = true;
+  autoUpdater.quitAndInstall(true, true);
+});
+
+// Allow renderer to manually trigger a check
+ipcMain.handle('updater:check', () => {
+  const isDev = !app.isPackaged || !!VITE_DEV_SERVER_URL;
+  if (isDev) return { status: 'dev' };
+  autoUpdater.checkForUpdates();
+  return { status: 'checking' };
+});

@@ -12,15 +12,15 @@ function App() {
   const [showTelemetry, setShowTelemetry] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
 
-  // Windows-to-Windows Connection State
-  const [discoveredPcs, setDiscoveredPcs] = useState<{ hostname: string; ip: string; port: number; machineId: string; isPaired: boolean }[]>([]);
+  // PC-to-PC Connection State
+  const [discoveredPcs, setDiscoveredPcs] = useState<{ hostname: string; ip: string; port: number; machineId: string; isPaired: boolean; isConnected?: boolean; device?: string }[]>([]);
   const [clientConnected, setClientConnected] = useState(false);
   const [clientIp, setClientIp] = useState('');
   const [clientHostname, setClientHostname] = useState('');
   const [clientError, setClientError] = useState('');
   const [pairedDevices, setPairedDevices] = useState<{ machineId: string; hostname: string; lastKnownIp: string }[]>([]);
   const [localMachineId, setLocalMachineId] = useState('');
-  
+
   // Auto-updater state
   const [updateState, setUpdateState] = useState<{
     status: 'checking' | 'available' | 'uptodate' | 'downloading' | 'downloaded' | 'error' | 'dev';
@@ -53,10 +53,6 @@ function App() {
     const time = new Date().toLocaleTimeString();
     setLogs(prev => [`[${time}] ${message}`, ...prev].slice(0, 10));
   }, []);
-
-  // Generate the magic connection string for the QR code
-  const magicLink = `IP:${ipAddress}|KEY:${syncKey}`;
-  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(magicLink)}`;
 
   useEffect(() => {
     // Global selection reset to prevent sync-engine stalls
@@ -185,7 +181,7 @@ function App() {
         if (connected && mode === 'ghost') {
           addLog('🛰️ Ghost Sync Active (Background Channel)');
         } else if (connected && mode === 'socket') {
-          addLog('🟢 Live Socket Active (Foreground Channel)');
+          addLog('⚡ Live Socket Active (Foreground Channel)');
         } else if (!connected) {
           // Only show offline if client is also not connected
           if (!clientConnected) {
@@ -353,7 +349,7 @@ function App() {
         type: file.type || 'application/octet-stream',
         path: filePath,
       });
-      addLog(`⏳ Transferring ${file.name} to Android...`);
+      addLog(`⏳ Transferring ${file.name} to devices...`);
     } else {
       addLog('❌ IPC Bridge not found. Are you in Electron?');
     }
@@ -463,7 +459,7 @@ function App() {
       onDragOver={handleDragOver}
     >
       {/* Custom Title Bar */}
-      <div 
+      <div
         className="window-titlebar"
         style={{
           height: '30px',
@@ -474,13 +470,13 @@ function App() {
           WebkitAppRegion: 'drag',
           userSelect: 'none',
           zIndex: 9999
-        }}
+        } as React.CSSProperties}
       >
-        <div 
-          style={{ 
-            display: 'flex', 
-            WebkitAppRegion: 'no-drag' 
-          }}
+        <div
+          style={{
+            display: 'flex',
+            WebkitAppRegion: 'no-drag'
+          } as React.CSSProperties}
         >
           {/* Minimize Button */}
           <button
@@ -590,26 +586,28 @@ function App() {
         <div className="modal-overlay">
           <div className="pairing-modal-content">
             <div className="pairing-modal-glow"></div>
-            <span className="pairing-device-icon">💻</span>
+            <span className="pairing-device-icon" style={{ display: 'flex', alignItems: 'center' }}>
+              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+            </span>
             <h3>
-              {pairingModal.isInitiator 
-                ? `Pairing with ${pairingModal.remoteHostname}` 
+              {pairingModal.isInitiator
+                ? `Pairing with ${pairingModal.remoteHostname}`
                 : `Pairing Request`}
             </h3>
             <p className="ip-text">IP Address: {pairingModal.remoteIp}</p>
-            
+
             <div className="pairing-code-box">
               {pairingModal.pairingCode.split('').map((char, index) => (
                 <span key={index} className="pairing-digit">{char}</span>
               ))}
             </div>
-            
+
             <p className="instruction-text">
-              {pairingModal.isInitiator 
+              {pairingModal.isInitiator
                 ? "Confirm this pairing code matches on the target PC."
                 : `Verify this code matches on the requesting PC to authorize connection from ${pairingModal.remoteHostname}.`}
             </p>
-            
+
             <div className="modal-actions">
               {pairingModal.isInitiator ? (
                 <button className="btn btn-danger btn-cancel-modal" onClick={cancelPairing}>
@@ -635,7 +633,7 @@ function App() {
         <div className="modal-overlay" onClick={() => setInfoModalOpen(false)}>
           <div className="pairing-modal-content" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '400px', padding: '2.5rem 2rem' }}>
             <div className="pairing-modal-glow"></div>
-            
+
             {/* App Icon */}
             <div style={{
               width: '64px',
@@ -679,7 +677,9 @@ function App() {
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span style={{ color: 'var(--muted)' }}>Platform</span>
-                <span style={{ textTransform: 'capitalize' }}>{appInfo?.platform || 'Windows'}</span>
+                <span style={{ textTransform: 'capitalize' }}>
+                  {appInfo?.platform === 'win32' ? 'Windows' : appInfo?.platform || 'Windows'}
+                </span>
               </div>
               {appInfo?.lastUpdated && (
                 <div style={{ display: 'flex', justifyContent: 'space-between' }}>
@@ -689,7 +689,6 @@ function App() {
                       try {
                         let date = new Date(appInfo.lastUpdated);
                         if (isNaN(date.getTime())) {
-                          // Try manual parsing of MM/DD/YYYY or DD/MM/YYYY
                           const match = appInfo.lastUpdated.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})$/);
                           if (match) {
                             const p1 = parseInt(match[1], 10);
@@ -723,10 +722,10 @@ function App() {
               </div>
               <div style={{ display: 'flex', justifyContent: 'space-between' }}>
                 <span style={{ color: 'var(--muted)' }}>Website</span>
-                <a 
-                  href="https://link.codebminds.com" 
-                  target="_blank" 
-                  rel="noreferrer" 
+                <a
+                  href="https://link.codebminds.com"
+                  target="_blank"
+                  rel="noreferrer"
                   style={{ color: 'var(--accent)', textDecoration: 'none', fontWeight: 600 }}
                   onMouseEnter={(e) => e.currentTarget.style.textDecoration = 'underline'}
                   onMouseLeave={(e) => e.currentTarget.style.textDecoration = 'none'}
@@ -776,8 +775,8 @@ function App() {
                 {updateState?.status === 'checking' ? 'Checking for updates...' : 'Check for updates'}
               </button>
 
-              <button 
-                className="btn" 
+              <button
+                className="btn"
                 onClick={() => setInfoModalOpen(false)}
                 style={{
                   width: '100%',
@@ -857,99 +856,6 @@ function App() {
       </header>
 
       <div className="main-layout">
-        <aside className="sidebar">
-          <div className="card">
-            <h2>Pair Device</h2>
-            <div style={{
-              background: '#fff',
-              padding: '10px',
-              borderRadius: '12px',
-              display: 'flex',
-              justifyContent: 'center',
-              boxShadow: '0 0 15px rgba(0,0,0,0.5)',
-              overflow: 'hidden'
-            }}>
-              <img
-                src={qrUrl}
-                alt="Connect QR"
-                style={{ width: '140px', height: '140px', borderRadius: '4px' }}
-              />
-            </div>
-            <p style={{ fontSize: '0.65rem', color: 'var(--muted)', textAlign: 'center', marginTop: '8px' }}>
-              SCAN TO CONNECT INSTANTLY
-            </p>
-          </div>
-
-
-          <div className="card">
-            <h2>Local Node</h2>
-            <div className="ip-info" style={{ color: ipAddress === 'Loading...' ? 'var(--muted)' : 'var(--fg-color)' }}>
-              {ipAddress === 'Loading...' ? 'INITIALIZING...' : `${ipAddress}:4321`}
-            </div>
-          </div>
-
-          <div className="card">
-            <h2>Security Key</h2>
-            <div style={{ position: 'relative', display: 'flex', alignItems: 'center' }}>
-              <input
-                type={showKey ? 'text' : 'password'}
-                value={syncKey}
-                placeholder="Enter Secret Key"
-                onChange={(e) => handleSyncKeyChange(e.target.value)}
-                onMouseUp={() => {
-                  setTimeout(() => {
-                    window.getSelection()?.removeAllRanges();
-                  }, 2000);
-                }}
-                style={{
-                  paddingRight: '45px',
-                  letterSpacing: showKey ? '0' : '4px',
-                  fontFamily: showKey ? "'JetBrains Mono', monospace" : 'inherit',
-                  userSelect: 'text',
-                  WebkitUserSelect: 'text'
-                }}
-              />
-              <button
-                onClick={() => setShowKey(!showKey)}
-                style={{
-                  position: 'absolute',
-                  right: '12px',
-                  background: 'none',
-                  border: 'none',
-                  color: 'var(--muted)',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  transition: 'all 0.2s ease',
-                  padding: '4px'
-                }}
-                onMouseEnter={(e) => e.currentTarget.style.color = 'var(--accent)'}
-                onMouseLeave={(e) => e.currentTarget.style.color = 'var(--muted)'}
-              >
-                {showKey ? (
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M9.88 9.88a3 3 0 1 0 4.24 4.24" />
-                    <path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68" />
-                    <path d="M6.61 6.61A13.52 13.52 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61" />
-                    <line x1="2" x2="22" y1="2" y2="22" />
-                  </svg>
-                ) : (
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z" />
-                    <circle cx="12" cy="12" r="3" />
-                  </svg>
-                )}
-              </button>
-            </div>
-            <p style={{ fontSize: '0.6rem', color: 'var(--muted)', marginTop: '4px' }}>Must match Android device</p>
-          </div>
-
-          <div className="" style={{ marginTop: 'auto' }}>
-            <p style={{ fontSize: '0.7rem', color: 'var(--muted)' }}>&copy; {new Date().getFullYear()} CODEB MINDS</p>
-          </div>
-        </aside>
-
         <main className="content-area">
           <div className="card">
             <h2>Live Clipboard</h2>
@@ -962,12 +868,14 @@ function App() {
           </div>
 
           <div className="card">
-            <h2>Windows Node Link (PC-to-PC)</h2>
+            <h2>Linked Devices (PC-to-PC / Mobile)</h2>
             <div className="windows-link-container">
               {clientConnected ? (
                 <div className="connected-banner">
                   <div className="banner-info">
-                    <span className="banner-icon">💻</span>
+                    <span className="banner-icon" style={{ display: 'flex', alignItems: 'center' }}>
+                      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+                    </span>
                     <div>
                       <div className="banner-title">CONNECTED TO REMOTE HOST</div>
                       <div className="banner-desc">{clientHostname} ({clientIp})</div>
@@ -991,30 +899,52 @@ function App() {
                   {clientError && <div className="error-banner">{clientError}</div>}
 
                   <div className="discovered-list-container">
-                    <h3>DISCOVERED NEARBY WINDOWS PCs</h3>
+                    <h3>DISCOVERED NEARBY DEVICES</h3>
                     {discoveredPcs.length === 0 ? (
                       <div className="no-nodes">
                         <div className="pulse-dot"></div>
-                        Searching for nearby Windows PCs on WiFi...
+                        Searching for nearby Windows PCs &amp; Android devices on WiFi...
                       </div>
                     ) : (
                       <div className="pc-list">
                         {discoveredPcs.map((pc) => (
                           <div className="pc-row" key={pc.ip}>
                             <div className="pc-info">
-                              <span className="pc-icon">💻</span>
+                              <span className="pc-icon" style={{ display: 'flex', alignItems: 'center' }}>
+                                {pc.device === 'android' ? (
+                                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"></rect><line x1="12" y1="18" x2="12.01" y2="18"></line></svg>
+                                ) : (
+                                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect><line x1="8" y1="21" x2="16" y2="21"></line><line x1="12" y1="17" x2="12" y2="21"></line></svg>
+                                )}
+                              </span>
                               <div>
                                 <div className="pc-name" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                                   {pc.hostname}
-                                  {pc.isPaired && <span className="paired-badge">PAIRED</span>}
                                 </div>
                                 <div className="pc-ip">{pc.ip}</div>
                               </div>
                             </div>
                             <div className="pc-actions" style={{ display: 'flex', gap: '8px' }}>
-                              <button className="btn btn-sm" onClick={() => connectToPc(pc.ip, pc.machineId)}>
-                                {pc.isPaired ? "Connect" : "Pair & Connect"}
-                              </button>
+                              {pc.device !== 'android' && (
+                                <button className="btn btn-sm" onClick={() => connectToPc(pc.ip, pc.machineId)}>
+                                  {pc.isPaired ? "Connect" : "Pair & Connect"}
+                                </button>
+                              )}
+                              {pc.device === 'android' && !pc.isPaired && (
+                                <button className="btn btn-sm" onClick={() => connectToPc(pc.ip, pc.machineId)}>
+                                  Pair Phone
+                                </button>
+                              )}
+                              {pc.device === 'android' && pc.isPaired && !pc.isConnected && (
+                                <button className="btn btn-sm" onClick={() => connectToPc(pc.ip, pc.machineId)}>
+                                  Connect
+                                </button>
+                              )}
+                              {pc.device === 'android' && pc.isPaired && pc.isConnected && (
+                                <button className="btn btn-sm btn-danger" onClick={() => window.ipcRenderer.send('disconnect-android', pc.machineId)}>
+                                  Disconnect
+                                </button>
+                              )}
                               {pc.isPaired && (
                                 <button className="btn btn-sm btn-danger" onClick={() => unpairDevice(pc.machineId)}>
                                   Unpair
@@ -1031,8 +961,6 @@ function App() {
             </div>
           </div>
 
-
-
           <div className="card" style={{ flex: 1 }}>
             <h2>Universal File Share</h2>
             <div className="file-drop-area">
@@ -1040,6 +968,9 @@ function App() {
               <p style={{ fontWeight: '700', fontSize: '0.9rem' }}>DROP ANY FILE TO SYNC</p>
               <p style={{ fontSize: '0.7rem', marginTop: '8px' }}>Supports PDF, APK, ZIP, Media & More</p>
             </div>
+          </div>
+          <div style={{ marginTop: 'auto', paddingTop: '10px' }}>
+            <p style={{ fontSize: '0.7rem', color: 'var(--muted)', textAlign: 'center' }}>&copy; {new Date().getFullYear()} CODEB MINDS</p>
           </div>
         </main>
 
