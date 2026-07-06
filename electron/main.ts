@@ -458,7 +458,116 @@ function startSocketServer() {
       });
       return;
 
-      // ── POST /api/ghost/receipt  (Android → PC confirmation) ─────────────
+    // ── POST /api/upload  (Android → PC File Streaming) ────────────────
+    } else if (req.method === 'POST' && req.url?.startsWith('/api/upload')) {
+      const signature = req.headers['x-signature'] as string;
+      if (!signature) {
+        console.warn(`[Security] Ignored file upload from: ${req.socket.remoteAddress} (Missing signature)`);
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized: Missing signature' }));
+        return;
+      }
+
+      // Verify signature against paired devices
+      let authorizedDevice = null;
+      for (const device of config.pairedDevices) {
+        try {
+          const bytes = CryptoJS.AES.decrypt(signature, device.secretKey);
+          const decryptedStr = bytes.toString(CryptoJS.enc.Utf8);
+          if (decryptedStr) {
+            const payload = JSON.parse(decryptedStr);
+            const timeDiff = Math.abs(Date.now() - payload.timestamp);
+            if (payload.machineId === device.machineId && timeDiff < 86400000) {
+              authorizedDevice = device;
+              break;
+            }
+          }
+        } catch (e) {}
+      }
+
+      if (!authorizedDevice) {
+        console.warn(`[Security] Ignored file upload: signature verification failed.`);
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized: Invalid signature' }));
+        return;
+      }
+
+      try {
+        const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+        const fileNameParam = urlObj.searchParams.get('name') || '';
+        const decodedName = decodeURIComponent(fileNameParam) || `upload_${Date.now()}`;
+
+        const downloadsPath = path.join(os.homedir(), 'Downloads');
+        if (!fs.existsSync(downloadsPath)) fs.mkdirSync(downloadsPath, { recursive: true });
+        const safeName = sanitizeFileName(decodedName);
+        const filePath = resolveUniqueFilePath(downloadsPath, safeName);
+
+        let fileStream: fs.WriteStream | null = fs.createWriteStream(filePath);
+        let cleanupCalled = false;
+
+        const cleanup = (errorMsg: string) => {
+          if (cleanupCalled) return;
+          cleanupCalled = true;
+
+          if (fileStream) {
+            fileStream.destroy();
+            fileStream = null;
+          }
+
+          fs.unlink(filePath, () => {});
+          console.error('Upload failed:', errorMsg);
+
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: errorMsg }));
+          }
+        };
+
+        req.pipe(fileStream);
+
+        fileStream.on('finish', () => {
+          if (cleanupCalled) return;
+
+          if (!req.complete) {
+            cleanup('Upload aborted or incomplete');
+            return;
+          }
+
+          fileStream?.close(() => {
+            const savedName = path.basename(filePath);
+            console.log(`📂 File uploaded and saved: ${filePath}`);
+            win?.webContents.send('file-saved', { name: savedName, path: filePath });
+
+            if (!res.headersSent) {
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, name: savedName }));
+            }
+          });
+        });
+
+        fileStream.on('error', (err: any) => {
+          cleanup(err.message);
+        });
+
+        req.on('error', (err: any) => {
+          cleanup(err.message);
+        });
+
+        req.on('close', () => {
+          if (!req.complete && !cleanupCalled) {
+            cleanup('Client disconnected mid-upload');
+          }
+        });
+      } catch (err: any) {
+        console.error('Upload initialization error:', err);
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: err.message }));
+        }
+      }
+      return;
+
+    // ── POST /api/ghost/receipt  (Android → PC confirmation) ─────────────
     } else if (req.method === 'POST' && req.url === '/api/ghost/receipt') {
       let body = '';
       req.on('data', (chunk: string) => { body += chunk; });
@@ -544,7 +653,22 @@ function startSocketServer() {
         });
         const stream = fs.createReadStream(entry.filePath);
         stream.pipe(res);
-        stream.on('error', () => { if (!res.writableEnded) res.end(); });
+
+        const cleanup = () => {
+          stream.destroy();
+        };
+
+        res.on('close', cleanup);
+        res.on('finish', cleanup);
+
+        stream.on('error', (err) => {
+          console.error('File stream read error:', err);
+          cleanup();
+          if (!res.writableEnded) {
+            res.writeHead(500);
+            res.end('File read error');
+          }
+        });
       } catch (e) {
         res.writeHead(500);
         res.end();
@@ -840,26 +964,62 @@ function startSocketServer() {
 
         if (fileData.url) {
           console.log(`Downloading file from URL: ${fileData.url}`);
-          http.get(fileData.url, (res) => {
+          let fileStream: fs.WriteStream | null = null;
+          let cleanupCalled = false;
+
+          const cleanup = (errorMsg: string) => {
+            if (cleanupCalled) return;
+            cleanupCalled = true;
+
+            if (fileStream) {
+              fileStream.destroy();
+            }
+
+            fs.unlink(filePath, () => {});
+
+            console.error('Download failed:', errorMsg);
+            ack?.({ ok: false, error: errorMsg });
+            socket.emit('file-delivered-phone', { name: fileData.name, ok: false, error: errorMsg });
+          };
+
+          const req = http.get(fileData.url, (res) => {
             if (res.statusCode === 200) {
-              const fileStream = fs.createWriteStream(filePath);
+              fileStream = fs.createWriteStream(filePath);
               res.pipe(fileStream);
+
               fileStream.on('finish', () => {
-                fileStream.close();
-                console.log(`📂 File saved: ${filePath}`);
-                win?.webContents.send('file-saved', { name: path.basename(filePath), path: filePath });
-                ack?.({ ok: true, name: path.basename(filePath) });
-                socket.emit('file-delivered-phone', { name: fileData.name, ok: true });
+                if (cleanupCalled) return;
+                fileStream?.close(() => {
+                  console.log(`📂 File saved: ${filePath}`);
+                  win?.webContents.send('file-saved', { name: path.basename(filePath), path: filePath });
+                  ack?.({ ok: true, name: path.basename(filePath) });
+                  socket.emit('file-delivered-phone', { name: fileData.name, ok: true });
+                });
+              });
+
+              fileStream.on('error', (err) => {
+                cleanup(err.message);
+              });
+
+              res.on('error', (err) => {
+                cleanup(err.message);
+              });
+
+              res.on('aborted', () => {
+                cleanup('Download aborted by remote host');
               });
             } else {
-              console.error('Download failed, status code:', res.statusCode);
-              ack?.({ ok: false, error: `HTTP ${res.statusCode}` });
-              socket.emit('file-delivered-phone', { name: fileData.name, ok: false, error: `HTTP ${res.statusCode}` });
+              cleanup(`HTTP status ${res.statusCode}`);
             }
-          }).on('error', (err) => {
-            console.error('Download error:', err);
-            ack?.({ ok: false, error: err.message });
-            socket.emit('file-delivered-phone', { name: fileData.name, ok: false, error: err.message });
+          });
+
+          req.on('error', (err) => {
+            cleanup(err.message);
+          });
+
+          req.setTimeout(30000, () => {
+            req.destroy();
+            cleanup('Request timeout');
           });
         } else if (fileData.data) {
           const buffer = Buffer.from(fileData.data, 'base64');
@@ -1193,21 +1353,61 @@ function connectToRemotePc(ip: string, targetMachineId: string) {
         const filePath = resolveUniqueFilePath(downloadsPath, safeName);
 
         if (fileData.url) {
-          http.get(fileData.url, (res) => {
+          console.log(`Downloading file from URL: ${fileData.url}`);
+          let fileStream: fs.WriteStream | null = null;
+          let cleanupCalled = false;
+
+          const cleanup = (errorMsg: string) => {
+            if (cleanupCalled) return;
+            cleanupCalled = true;
+
+            if (fileStream) {
+              fileStream.destroy();
+            }
+
+            fs.unlink(filePath, () => {});
+
+            console.error('PC-to-PC download failed:', errorMsg);
+            clientSocket.emit('file-delivered-phone', { name: fileData.name, ok: false, error: errorMsg });
+          };
+
+          const req = http.get(fileData.url, (res) => {
             if (res.statusCode === 200) {
-              const fileStream = fs.createWriteStream(filePath);
+              fileStream = fs.createWriteStream(filePath);
               res.pipe(fileStream);
+
               fileStream.on('finish', () => {
-                fileStream.close();
-                console.log(`📂 File saved from remote PC: ${filePath}`);
-                win?.webContents.send('file-saved', { name: path.basename(filePath), path: filePath });
-                clientSocket.emit('file-delivered-phone', { name: fileData.name, ok: true });
+                if (cleanupCalled) return;
+                fileStream?.close(() => {
+                  console.log(`📂 File saved from remote PC: ${filePath}`);
+                  win?.webContents.send('file-saved', { name: path.basename(filePath), path: filePath });
+                  clientSocket.emit('file-delivered-phone', { name: fileData.name, ok: true });
+                });
+              });
+
+              fileStream.on('error', (err) => {
+                cleanup(err.message);
+              });
+
+              res.on('error', (err) => {
+                cleanup(err.message);
+              });
+
+              res.on('aborted', () => {
+                cleanup('Download aborted by remote PC');
               });
             } else {
-              clientSocket.emit('file-delivered-phone', { name: fileData.name, ok: false, error: `HTTP ${res.statusCode}` });
+              cleanup(`HTTP status ${res.statusCode}`);
             }
-          }).on('error', (err) => {
-            clientSocket.emit('file-delivered-phone', { name: fileData.name, ok: false, error: err.message });
+          });
+
+          req.on('error', (err) => {
+            cleanup(err.message);
+          });
+
+          req.setTimeout(30000, () => {
+            req.destroy();
+            cleanup('Request timeout');
           });
         } else if (fileData.data) {
           const buffer = Buffer.from(fileData.data, 'base64');
