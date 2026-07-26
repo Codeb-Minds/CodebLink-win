@@ -77,6 +77,6 @@
     "vite": "^5.4.1"
   },
   "overrides": {
-    "shell-quote": "^1.8.4"
+    "shell-quote": "^1.10.0"
   }
 }
